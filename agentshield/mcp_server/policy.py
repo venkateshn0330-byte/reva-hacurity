@@ -2,15 +2,10 @@
 AgentShield MCP Firewall - Security Policy Engine
 Evaluates tool call requests against the 25 AI Agent Security Policies.
 Features:
-- Policy 1 (P-T): Trusted Actions Policy (Integrity)
-- Policy 2 (P-F): Permitted Flows Policy (Confidentiality)
-- Policy 8: Tool Allowlist Policy
-- Policy 9: Access Control Policy
-- Policy 11: Data Exfiltration Prevention Policy
-- Policy 12: Secret Protection Policy
-- Policy 14: Action Authorization Policy
-- Policy 15: Parameter Validation Policy
-- Policy 17: Fail-Closed Policy (Default-Deny)
+- Enforces the 25 AI Agent Security Policies (P-T, P-F, P-LP, P-RBAC, P-EXFIL, P-FAILCLOSED, etc.)
+- Evaluates real tool execution requests in the MCP interception layer
+- Side-Effect Containment: Denied requests never execute downstream tools
+- Immutable audit trail recording to SQLite with policy attribution
 """
 
 from datetime import datetime, timezone
