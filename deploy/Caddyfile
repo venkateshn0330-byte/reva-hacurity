@@ -1,0 +1,36 @@
+# Caddyfile: Production TLS Termination and Trusted Proxy Configuration for AgentShield
+{
+    email security@yourdomain.com
+}
+
+agentshield.example.com {
+    # Forward all traffic to the AgentShield application container
+    reverse_proxy agentshield-api:8000 {
+        # Pass client headers and scheme for cookie/CSRF detection
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+
+        # Enable streaming support for MCP HTTP transport
+        flush_interval -1
+    }
+
+    # Security headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    }
+
+    # Enable gzip / zstd compression
+    encode zstd gzip
+
+    # Access logging
+    log {
+        output stdout
+        format json
+    }
+}

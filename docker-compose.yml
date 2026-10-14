@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  # AgentShield Core Security Gateway & API
+  agentshield-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agentshield-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - AGENTSHIELD_ENV=production
+      - AGENTSHIELD_SECURE_COOKIES=1
+      - AGENTSHIELD_DEV_MODE=0
+      - AGENTSHIELD_DB_PATH=/var/lib/agentshield/data/events.db
+    volumes:
+      # Persistent host directory for SQLite WAL database storage
+      - agentshield-db-data:/var/lib/agentshield/data
+    networks:
+      - internal-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+
+  # Production Reverse Proxy with Automatic HTTPS (Caddy)
+  reverse-proxy:
+    image: caddy:2-alpine
+    container_name: agentshield-proxy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      agentshield-api:
+        condition: service_healthy
+    networks:
+      - internal-net
+
+volumes:
+  agentshield-db-data:
+    driver: local
+  caddy-data:
+    driver: local
+  caddy-config:
+    driver: local
+
+networks:
+  internal-net:
+    driver: bridge

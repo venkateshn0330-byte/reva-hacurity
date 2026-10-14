@@ -161,7 +161,15 @@ TOOLS_MANIFEST = [
 ]
 
 
-def _safe_log_event(agent_id: str, tool_name: str, arguments: Dict[str, Any], decision: Dict[str, Any], downstream_status: str):
+def _safe_log_event(
+    agent_id: str,
+    tool_name: str,
+    arguments: Dict[str, Any],
+    decision: Dict[str, Any],
+    downstream_status: str,
+    project_id: str = "proj_default",
+    is_upstream: int = 0,
+):
     """Safely log event to SQLite without throwing exceptions to caller."""
     try:
         from agentshield.backend.app.services.event_logger import log_decision
@@ -171,28 +179,63 @@ def _safe_log_event(agent_id: str, tool_name: str, arguments: Dict[str, Any], de
             arguments=arguments,
             decision=decision,
             downstream_status=downstream_status,
+            project_id=project_id,
+            is_upstream=is_upstream,
         )
     except Exception as err:
         logger.warning(f"Could not write audit log to SQLite: {err}")
 
 
-def dispatch_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+def dispatch_tool(
+    tool_name: str,
+    arguments: Dict[str, Any],
+    authenticated_agent_id: Optional[str] = None,
+    project_id: str = "proj_default",
+) -> Dict[str, Any]:
     """
     Core security gateway dispatcher.
-    Enforces authorization check BEFORE executing any protected tool.
-    Logs every decision to the SQLite audit database.
+    Enforces authorization check BEFORE executing any protected tool or forwarding to upstream servers.
+    Logs every decision to the SQLite audit database scoped to project_id.
+    If authenticated_agent_id is provided, it strictly overrides any client-asserted agent_id.
     """
-    agent_id = arguments.get("agent_id", "demo-agent")
-    logger.info(f"INCOMING REQUEST: tool='{tool_name}', agent='{agent_id}', args={json.dumps(arguments)}")
+    if authenticated_agent_id:
+        agent_id = authenticated_agent_id
+        # Force the authenticated identity into arguments so downstream cannot be spoofed
+        arguments = {**arguments, "agent_id": authenticated_agent_id}
+    else:
+        agent_id = arguments.get("agent_id", "demo-agent")
+
+    logger.info(f"INCOMING REQUEST: tool='{tool_name}', agent='{agent_id}', project='{project_id}', args={json.dumps(arguments)}")
+
+    # Check if project has an active upstream MCP configuration
+    upstream_conf = None
+    is_upstream_tool = False
+    original_upstream_name = tool_name
+    try:
+        from agentshield.backend.app.database import db
+        upstream_conf = db.get_upstream_server(project_id, decrypt=True)
+        if upstream_conf:
+            prefix = upstream_conf.get("tool_prefix", "upstream_")
+            if tool_name.startswith(prefix):
+                is_upstream_tool = True
+                original_upstream_name = tool_name[len(prefix):]
+    except Exception as exc:
+        logger.warning(f"Error checking upstream server for project {project_id}: {exc}")
 
     # 1. SHARED SECURITY AUTHORIZATION GATEWAY
-    decision = authorize(tool_name=tool_name, arguments=arguments, agent_id=agent_id)
+    decision = authorize(
+        tool_name=tool_name,
+        arguments=arguments,
+        agent_id=agent_id,
+        project_id=project_id,
+        is_upstream=is_upstream_tool,
+    )
     
     if not decision.get("allowed", False):
         reason = decision.get("reason", "Operation blocked by AgentShield security policy.")
         risk = decision.get("risk_level", "HIGH")
         logger.warning(
-            f"SECURITY GATEWAY BLOCKED: tool='{tool_name}' agent='{agent_id}' risk={risk} reason='{reason}'"
+            f"SECURITY GATEWAY BLOCKED: tool='{tool_name}' agent='{agent_id}' project='{project_id}' risk={risk} reason='{reason}'"
         )
         
         # Log blocked event to SQLite
@@ -202,6 +245,8 @@ def dispatch_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
             arguments=arguments,
             decision=decision,
             downstream_status="BLOCKED",
+            project_id=project_id,
+            is_upstream=1 if is_upstream_tool else 0,
         )
 
         return {
@@ -215,7 +260,7 @@ def dispatch_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
                         f"Risk Level: {risk}\n"
                         f"Reason: {reason}\n"
                         f"Timestamp: {decision.get('timestamp')}\n"
-                        f"Downstream Execution: CANCELLED (Safe mock tool was not executed)"
+                        f"Downstream Execution: CANCELLED (Action was not executed or forwarded)"
                     ),
                 }
             ],
@@ -224,7 +269,51 @@ def dispatch_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     # 2. DOWNSTREAM PROTECTED EXECUTION (ONLY IF ALLOWED)
-    logger.info(f"SECURITY GATEWAY PERMITTED: tool='{tool_name}' agent='{agent_id}'")
+    logger.info(f"SECURITY GATEWAY PERMITTED: tool='{tool_name}' agent='{agent_id}' (upstream={is_upstream_tool})")
+
+    # Upstream Forwarding Path
+    if is_upstream_tool and upstream_conf:
+        try:
+            from agentshield.mcp_server.upstream_client import forward_tool_call
+            upstream_resp = forward_tool_call(
+                upstream_url=upstream_conf["upstream_url"],
+                original_tool_name=original_upstream_name,
+                arguments=arguments,
+                auth_token=upstream_conf.get("raw_auth_token"),
+                auth_type=upstream_conf.get("auth_type", "bearer"),
+            )
+            downstream_status = upstream_resp.get("downstream_status", "EXECUTED")
+            _safe_log_event(
+                agent_id=agent_id,
+                tool_name=tool_name,
+                arguments=arguments,
+                decision=decision,
+                downstream_status=downstream_status,
+                project_id=project_id,
+                is_upstream=1,
+            )
+            return {
+                "content": upstream_resp["content"],
+                "isError": upstream_resp["isError"],
+                "_security_decision": decision,
+            }
+        except Exception as e:
+            logger.error(f"Failed forwarding tool call to upstream: {e}", exc_info=True)
+            _safe_log_event(
+                agent_id=agent_id,
+                tool_name=tool_name,
+                arguments=arguments,
+                decision=decision,
+                downstream_status="FAILED",
+                project_id=project_id,
+                is_upstream=1,
+            )
+            return {
+                "content": [{"type": "text", "text": f"Upstream execution error: {str(e)}"}],
+                "isError": True,
+            }
+
+    # Built-in Protected Sandbox Tools
     try:
         if tool_name == "read_document":
             doc_id = arguments.get("document_id") or arguments.get("resource_id")
@@ -255,6 +344,8 @@ def dispatch_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
             arguments=arguments,
             decision=decision,
             downstream_status="EXECUTED",
+            project_id=project_id,
+            is_upstream=0,
         )
 
         return {
@@ -275,6 +366,7 @@ def dispatch_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
             arguments=arguments,
             decision=decision,
             downstream_status="FAILED",
+            project_id=project_id,
         )
         return {
             "content": [{"type": "text", "text": f"Tool execution failed: {str(e)}"}],
@@ -282,11 +374,49 @@ def dispatch_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
-def handle_jsonrpc_message(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Process a single JSON-RPC 2.0 message conforming to the MCP specification and IBM Bob client."""
+def handle_jsonrpc_message(
+    message: Any,
+    authenticated_agent_id: Optional[str] = None,
+    project_id: str = "proj_default",
+) -> Optional[Dict[str, Any]]:
+    """
+    Process a single JSON-RPC 2.0 message conforming to the MCP specification and IBM Bob client.
+    Reused by both STDIO transport and remote HTTP endpoints.
+    """
+    if not isinstance(message, dict):
+        return {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32600, "message": "Invalid Request: Payload must be a JSON object."},
+        }
+
     msg_id = message.get("id")
+    jsonrpc_ver = message.get("jsonrpc")
+
+    if jsonrpc_ver != "2.0":
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "error": {"code": -32600, "message": "Invalid Request: 'jsonrpc' version must be '2.0'."},
+        }
+
     method = message.get("method")
+    if not isinstance(method, str) or not method:
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "error": {"code": -32600, "message": "Invalid Request: 'method' must be a non-empty string."},
+        }
+
     params = message.get("params", {})
+    if params is None:
+        params = {}
+    elif not isinstance(params, dict):
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "error": {"code": -32602, "message": "Invalid params: 'params' must be an object/dict."},
+        }
 
     logger.info(f"Received JSON-RPC method: '{method}' (id: {msg_id})")
 
@@ -339,19 +469,61 @@ def handle_jsonrpc_message(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     # 5. Tool Discovery (tools/list)
     elif method == "tools/list":
+        combined_tools = list(TOOLS_MANIFEST)
+        if project_id and project_id != "proj_default":
+            try:
+                from agentshield.backend.app.database import db
+                from agentshield.mcp_server.upstream_client import discover_upstream_tools
+
+                upstream = db.get_upstream_server(project_id, decrypt=True)
+                if upstream:
+                    cached = upstream.get("cached_tools")
+                    if not cached:
+                        # Auto-discover tools if not yet cached
+                        success, discovered, _ = discover_upstream_tools(
+                            upstream_url=upstream["upstream_url"],
+                            auth_token=upstream.get("raw_auth_token"),
+                            auth_type=upstream.get("auth_type", "bearer"),
+                            tool_prefix=upstream.get("tool_prefix", "upstream_"),
+                        )
+                        if success:
+                            cached = discovered
+                            db.update_upstream_cached_tools(project_id, cached)
+                    if cached and isinstance(cached, list):
+                        for tool_item in cached:
+                            if isinstance(tool_item, dict) and "name" in tool_item:
+                                combined_tools.append(tool_item)
+            except Exception as exc:
+                logger.warning(f"Failed to query upstream tools for project '{project_id}': {exc}")
+
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {
-                "tools": TOOLS_MANIFEST,
+                "tools": combined_tools,
             },
         }
 
     # 6. Tool Invocation (tools/call)
     elif method == "tools/call":
-        tool_name = params.get("name", "")
+        tool_name = params.get("name")
+        if not isinstance(tool_name, str) or not tool_name:
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {"code": -32602, "message": "Invalid params: 'name' must be a valid tool name string."},
+            }
+
         arguments = params.get("arguments", {})
-        execution_result = dispatch_tool(tool_name=tool_name, arguments=arguments)
+        if not isinstance(arguments, dict):
+            arguments = {}
+
+        execution_result = dispatch_tool(
+            tool_name=tool_name,
+            arguments=arguments,
+            authenticated_agent_id=authenticated_agent_id,
+            project_id=project_id,
+        )
 
         wire_result = {
             "content": execution_result["content"],
@@ -376,6 +548,19 @@ def handle_jsonrpc_message(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "message": f"Method '{method}' not found or unsupported by AgentShield.",
             },
         }
+
+
+def process_jsonrpc_payload(
+    payload_dict: Any,
+    authenticated_agent_id: Optional[str] = None,
+    project_id: str = "proj_default",
+) -> Optional[Dict[str, Any]]:
+    """Shared dispatcher alias for external callers (HTTP, SSE, IPC)."""
+    return handle_jsonrpc_message(
+        payload_dict,
+        authenticated_agent_id=authenticated_agent_id,
+        project_id=project_id,
+    )
 
 
 def run_stdio_server():

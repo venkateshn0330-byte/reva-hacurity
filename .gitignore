@@ -39,6 +39,18 @@ frontend/dist/
 *.swp
 *.swo
 
-# SQLite temporary files
+# SQLite temporary files and databases
+*.db
 *.db-wal
 *.db-shm
+*.sqlite
+*.sqlite3
+data/*.db
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key

@@ -9,6 +9,7 @@ Features:
 """
 
 from datetime import datetime, timezone
+import json
 import os
 import re
 import sys
@@ -96,10 +97,17 @@ def _is_authorized_email(recipient: str) -> bool:
     return domain in AUTHORIZED_EMAIL_DOMAINS
 
 
-def authorize(tool_name: str, arguments: Dict[str, Any], agent_id: str = "demo-agent") -> Dict[str, Any]:
+def authorize(
+    tool_name: str,
+    arguments: Dict[str, Any],
+    agent_id: str = "demo-agent",
+    project_id: str = "proj_default",
+    is_upstream: bool = False,
+) -> Dict[str, Any]:
     """
     Main authorization entry point for AgentShield MCP tools.
     Evaluates against the 25 AI Agent Security Policies.
+    Applies project-specific identity and verifies active project status.
     
     Returns structured decision dictionary with exact policy attribution.
     """
@@ -107,9 +115,28 @@ def authorize(tool_name: str, arguments: Dict[str, Any], agent_id: str = "demo-a
     base_decision = {
         "tool_name": tool_name,
         "agent_id": agent_id,
+        "project_id": project_id,
         "timestamp": now,
-        "identity_status": "UNVERIFIED_ASSERTED",
+        "identity_status": "VERIFIED" if agent_id != "demo-agent" else "UNVERIFIED_ASSERTED",
     }
+
+    # Policy 9 (P-RBAC / Project Scope): Suspended or revoked projects cannot execute tools
+    if project_id and project_id != "proj_default":
+        try:
+            from agentshield.backend.app.database import db
+            proj = db.get_project(project_id)
+            if proj and proj.get("status") in ("suspended", "revoked"):
+                return {
+                    **base_decision,
+                    "allowed": False,
+                    "reason": f"Access denied: Project '{project_id}' is {proj.get('status')} and cannot execute tools.",
+                    "risk_level": "CRITICAL",
+                    "policy_id": 9,
+                    "policy_code": "P-RBAC",
+                    "policy_name": POLICIES_CATALOG[9].name,
+                }
+        except Exception:
+            pass
 
     # 1. READ_DOCUMENT Policy Evaluation
     if tool_name == "read_document":
@@ -285,7 +312,60 @@ def authorize(tool_name: str, arguments: Dict[str, Any], agent_id: str = "demo-a
             "policy_name": POLICIES_CATALOG[2].name,
         }
 
-    # 4. Policy 17 (Fail-Closed Policy) & Policy 8 (Tool Allowlist Policy): Default-Deny for Unknown Tools
+    # 4. Upstream Tool Policy Evaluation (P-T Prompt Injection, P-F Data Exfiltration, and P-AUTHZ)
+    elif is_upstream or tool_name.startswith("upstream_"):
+        args_str = json.dumps(arguments) if isinstance(arguments, dict) else str(arguments)
+
+        # Policy 1 (P-T: Trusted Actions): Block prompt injection instruction payloads
+        if _contains_injection_instructions(args_str):
+            return {
+                **base_decision,
+                "allowed": False,
+                "reason": "Access denied: Request driven by untrusted prompt injection instruction payload.",
+                "risk_level": "CRITICAL",
+                "policy_id": 1,
+                "policy_code": "P-T",
+                "policy_name": POLICIES_CATALOG[1].name,
+            }
+
+        # Policy 2 (P-F: Permitted Flows) & Policy 12 (Secret Protection): Confidential identifiers
+        if _is_confidential_identifier(args_str):
+            return {
+                **base_decision,
+                "allowed": False,
+                "reason": "Access denied: Upstream request arguments contain confidential or restricted identifiers.",
+                "risk_level": "CRITICAL",
+                "policy_id": 2,
+                "policy_code": "P-F",
+                "policy_name": POLICIES_CATALOG[2].name,
+            }
+
+        # Policy 14 (P-AUTHZ): Block unauthorized restricted actions
+        clean_name = tool_name
+        if clean_name.startswith("upstream_"):
+            clean_name = clean_name[len("upstream_"):]
+        if any(term in clean_name.lower() for term in ("restricted", "forbidden", "dangerous", "unauthorized")):
+            return {
+                **base_decision,
+                "allowed": False,
+                "reason": f"Access denied: Tool '{tool_name}' is classified as a restricted action and blocked by policy.",
+                "risk_level": "CRITICAL",
+                "policy_id": 14,
+                "policy_code": "P-AUTHZ",
+                "policy_name": POLICIES_CATALOG[14].name,
+            }
+
+        return {
+            **base_decision,
+            "allowed": True,
+            "reason": f"Upstream tool '{tool_name}' invocation authorized by project policy.",
+            "risk_level": "LOW",
+            "policy_id": 14,
+            "policy_code": "P-AUTHZ",
+            "policy_name": POLICIES_CATALOG[14].name,
+        }
+
+    # 5. Policy 17 (Fail-Closed Policy) & Policy 8 (Tool Allowlist Policy): Default-Deny for Unknown Tools
     else:
         return {
             **base_decision,

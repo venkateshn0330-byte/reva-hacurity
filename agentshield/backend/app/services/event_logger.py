@@ -27,9 +27,11 @@ def log_decision(
     decision: Dict[str, Any],
     downstream_status: str,
     request_id: Optional[str] = None,
+    project_id: str = "proj_default",
+    is_upstream: int = 0,
 ) -> Dict[str, Any]:
     """
-    Log an authorization decision to SQLite with full 25-Policy attribution.
+    Log an authorization decision to SQLite with full 25-Policy attribution and project scoping.
     """
     if not request_id:
         request_id = f"req-{uuid.uuid4().hex[:10]}"
@@ -39,6 +41,7 @@ def log_decision(
         or arguments.get("resource_id")
         or arguments.get("recipient")
         or arguments.get("destination")
+        or arguments.get("target")
         or "N/A"
     )
 
@@ -58,6 +61,8 @@ def log_decision(
         policy_id=policy_id,
         policy_code=policy_code,
         timestamp=decision.get("timestamp"),
+        project_id=project_id,
+        is_upstream=1 if is_upstream else 0,
     )
 
 
