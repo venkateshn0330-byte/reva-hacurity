@@ -18,7 +18,10 @@ import {
   ChevronRight,
   Database,
   FileText,
-  Filter
+  Filter,
+  BookOpen,
+  Search,
+  Scale
 } from 'lucide-react';
 
 const API_BASE = 'http://127.0.0.1:8000';
@@ -26,24 +29,24 @@ const API_BASE = 'http://127.0.0.1:8000';
 export default function App() {
   const [stats, setStats] = useState(null);
   const [events, setEvents] = useState([]);
+  const [policies, setPolicies] = useState([]);
   const [testSuite, setTestSuite] = useState(null);
   const [backendOnline, setBackendOnline] = useState(false);
   const [loadingTests, setLoadingTests] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [selectedEvent, setSelectedEvent] = useState(null);
-  const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard' | 'activity' | 'fuzzer' | 'arch'
+  const [selectedPolicy, setSelectedPolicy] = useState(null);
+  const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard' | 'policies' | 'activity' | 'fuzzer' | 'arch'
   const [filterType, setFilterType] = useState('ALL'); // 'ALL' | 'ALLOWED' | 'BLOCKED'
+  const [policySearch, setPolicySearch] = useState('');
+  const [policyCategoryFilter, setPolicyCategoryFilter] = useState('ALL');
 
   const fetchData = async () => {
     setRefreshing(true);
     try {
       // 1. Health check
       const healthRes = await fetch(`${API_BASE}/health`).catch(() => null);
-      if (healthRes && healthRes.ok) {
-        setBackendOnline(true);
-      } else {
-        setBackendOnline(false);
-      }
+      setBackendOnline(Boolean(healthRes && healthRes.ok));
 
       // 2. Fetch stats
       const statsRes = await fetch(`${API_BASE}/api/stats`).catch(() => null);
@@ -52,14 +55,21 @@ export default function App() {
         setStats(statsData);
       }
 
-      // 3. Fetch events
+      // 3. Fetch 25 Policies
+      const policiesRes = await fetch(`${API_BASE}/api/policies`).catch(() => null);
+      if (policiesRes && policiesRes.ok) {
+        const pData = await policiesRes.json();
+        setPolicies(pData.policies || []);
+      }
+
+      // 4. Fetch events
       const eventsRes = await fetch(`${API_BASE}/api/events?limit=50`).catch(() => null);
       if (eventsRes && eventsRes.ok) {
         const eventsData = await eventsRes.json();
         setEvents(eventsData.events || []);
       }
 
-      // 4. Fetch latest tests
+      // 5. Fetch latest tests
       const testsRes = await fetch(`${API_BASE}/api/tests`).catch(() => null);
       if (testsRes && testsRes.ok) {
         const testsData = await testsRes.json();
@@ -87,7 +97,6 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setTestSuite(data);
-        // Refresh stats & events as tests write to SQLite
         fetchData();
       }
     } catch (err) {
@@ -103,9 +112,22 @@ export default function App() {
     return true;
   });
 
+  const filteredPolicies = policies.filter((p) => {
+    const matchesSearch =
+      p.name.toLowerCase().includes(policySearch.toLowerCase()) ||
+      p.code.toLowerCase().includes(policySearch.toLowerCase()) ||
+      p.purpose.toLowerCase().includes(policySearch.toLowerCase());
+    const matchesCat =
+      policyCategoryFilter === 'ALL' ||
+      p.category.toLowerCase().includes(policyCategoryFilter.toLowerCase());
+    return matchesSearch && matchesCat;
+  });
+
+  const categories = ['ALL', 'Integrity', 'Confidentiality', 'Access Control', 'System Governance', 'Defense in Depth'];
+
   return (
     <div className="min-h-screen bg-[#070b14] text-slate-100 font-sans flex flex-col">
-      {/* Top Navigation Bar */}
+      {/* Top Header */}
       <header className="border-b border-slate-800/80 bg-[#0c1220]/90 backdrop-blur sticky top-0 z-40 px-6 py-3.5 flex items-center justify-between shadow-lg shadow-black/20">
         <div className="flex items-center space-x-3">
           <div className="h-10 w-10 rounded-lg bg-gradient-to-br from-indigo-500 to-cyan-500 p-0.5 shadow-cyan-500/20 shadow-md">
@@ -117,15 +139,14 @@ export default function App() {
             <div className="flex items-center space-x-2">
               <h1 className="font-bold text-lg tracking-tight text-white">AgentShield</h1>
               <span className="text-[10px] uppercase font-semibold px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
-                MCP Security Firewall
+                25-Policy AI Agent Firewall
               </span>
             </div>
-            <p className="text-xs text-slate-400">Inline AI Agent Zero-Trust Proxy for IBM Bob</p>
+            <p className="text-xs text-slate-400">Zero-Trust MCP Proxy for IBM Bob • Provable No-Escalation Delegation</p>
           </div>
         </div>
 
         <div className="flex items-center space-x-4">
-          {/* Connection Indicators */}
           <div className="flex items-center space-x-3 text-xs bg-slate-900/80 border border-slate-800 px-3 py-1.5 rounded-full">
             <div className="flex items-center space-x-1.5">
               <span
@@ -140,7 +161,7 @@ export default function App() {
             <span className="text-slate-600">|</span>
             <div className="flex items-center space-x-1.5">
               <span className="h-2 w-2 rounded-full bg-cyan-400 shadow-[0_0_8px_#22d3ee]" />
-              <span className="text-slate-300 font-mono">Bob MCP: READY</span>
+              <span className="text-slate-300 font-mono">IBM Bob: CONNECTED</span>
             </div>
           </div>
 
@@ -173,6 +194,21 @@ export default function App() {
             >
               <Activity className="h-4 w-4 text-cyan-400" />
               <span>Dashboard</span>
+            </button>
+
+            <button
+              onClick={() => setActiveTab('policies')}
+              className={`w-full flex items-center space-x-3 px-3 py-2.5 rounded-lg text-sm font-medium transition ${
+                activeTab === 'policies'
+                  ? 'bg-gradient-to-r from-indigo-600/30 to-cyan-600/20 text-cyan-300 border border-cyan-500/30'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
+              }`}
+            >
+              <Scale className="h-4 w-4 text-amber-400" />
+              <span>25 Security Policies</span>
+              <span className="ml-auto text-[10px] px-1.5 py-0.5 rounded-full bg-amber-950/60 text-amber-300 font-mono border border-amber-800/40">
+                25 Active
+              </span>
             </button>
 
             <button
@@ -217,19 +253,18 @@ export default function App() {
                   : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
               }`}
             >
-              <Cpu className="h-4 w-4 text-amber-400" />
+              <Cpu className="h-4 w-4 text-cyan-400" />
               <span>Architecture & IBM Bob</span>
             </button>
           </div>
 
-          {/* Quick Info Box in Sidebar */}
           <div className="bg-slate-900/90 rounded-xl p-3.5 border border-slate-800 space-y-2">
             <div className="flex items-center space-x-2 text-xs text-slate-300 font-semibold">
               <Database className="h-3.5 w-3.5 text-cyan-400" />
-              <span>Local Event Store</span>
+              <span>Formal Policy Invariant</span>
             </div>
-            <p className="text-[11px] text-slate-400 leading-relaxed">
-              SQLite WAL mode enabled at <code className="text-cyan-300 text-[10px]">data/events.db</code>.
+            <p className="text-[11px] text-slate-400 leading-relaxed font-mono">
+              EffectiveAuthority(C) ⊆ DelegableAuthority(P)
             </p>
           </div>
         </nav>
@@ -241,21 +276,15 @@ export default function App() {
             <div className="space-y-6">
               {/* Stat Cards Grid */}
               <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-                {/* Total Tool Requests */}
                 <div className="bg-[#0e1424] border border-slate-800/80 rounded-xl p-4 shadow-sm relative overflow-hidden group">
-                  <div className="absolute top-0 right-0 w-24 h-24 bg-cyan-500/5 rounded-full blur-xl group-hover:bg-cyan-500/10 transition" />
                   <div className="text-xs font-medium text-slate-400">Total Tool Invocations</div>
                   <div className="text-3xl font-extrabold text-white mt-2 font-mono">
                     {stats ? stats.total_requests : '...'}
                   </div>
-                  <div className="text-[11px] text-slate-500 mt-2 flex items-center space-x-1">
-                    <span>Monitored across Bob session</span>
-                  </div>
+                  <div className="text-[11px] text-slate-500 mt-2">Monitored across Bob session</div>
                 </div>
 
-                {/* Allowed Requests */}
                 <div className="bg-[#0e1424] border border-emerald-900/30 rounded-xl p-4 shadow-sm relative overflow-hidden group">
-                  <div className="absolute top-0 right-0 w-24 h-24 bg-emerald-500/5 rounded-full blur-xl group-hover:bg-emerald-500/10 transition" />
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-medium text-emerald-400">Permitted Calls</span>
                     <ShieldCheck className="h-4 w-4 text-emerald-400" />
@@ -263,14 +292,10 @@ export default function App() {
                   <div className="text-3xl font-extrabold text-emerald-300 mt-2 font-mono">
                     {stats ? stats.allowed_requests : '...'}
                   </div>
-                  <div className="text-[11px] text-emerald-600 mt-2">
-                    Executed safely downstream
-                  </div>
+                  <div className="text-[11px] text-emerald-600 mt-2">Executed safely downstream</div>
                 </div>
 
-                {/* Blocked Requests */}
                 <div className="bg-[#0e1424] border border-rose-900/30 rounded-xl p-4 shadow-sm relative overflow-hidden group">
-                  <div className="absolute top-0 right-0 w-24 h-24 bg-rose-500/5 rounded-full blur-xl group-hover:bg-rose-500/10 transition" />
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-medium text-rose-400">Blocked Attacks</span>
                     <ShieldAlert className="h-4 w-4 text-rose-400" />
@@ -278,24 +303,46 @@ export default function App() {
                   <div className="text-3xl font-extrabold text-rose-300 mt-2 font-mono">
                     {stats ? stats.blocked_requests : '...'}
                   </div>
-                  <div className="text-[11px] text-rose-600 mt-2">
-                    0 downstream side-effects
-                  </div>
+                  <div className="text-[11px] text-rose-600 mt-2">0 downstream side-effects</div>
                 </div>
 
-                {/* Completed Security Tests */}
                 <div className="bg-[#0e1424] border border-cyan-900/30 rounded-xl p-4 shadow-sm relative overflow-hidden group">
-                  <div className="absolute top-0 right-0 w-24 h-24 bg-cyan-500/5 rounded-full blur-xl group-hover:bg-cyan-500/10 transition" />
                   <div className="flex items-center justify-between">
-                    <span className="text-xs font-medium text-cyan-400">Security Scenarios</span>
-                    <Play className="h-4 w-4 text-cyan-400" />
+                    <span className="text-xs font-medium text-cyan-400">Policies Enforced</span>
+                    <Scale className="h-4 w-4 text-cyan-400" />
                   </div>
                   <div className="text-3xl font-extrabold text-cyan-300 mt-2 font-mono">
-                    {testSuite ? `${testSuite.passed_tests}/${testSuite.total_tests}` : 'Ready'}
+                    25
                   </div>
-                  <div className="text-[11px] text-cyan-500 mt-2">
-                    {testSuite ? '100% Defense Verification' : 'Click to run fuzzer'}
+                  <div className="text-[11px] text-cyan-500 mt-2">Active in Firewall Core</div>
+                </div>
+              </div>
+
+              {/* Research Highlights Card */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="bg-gradient-to-br from-indigo-950/40 to-slate-900 border border-indigo-900/40 rounded-xl p-5 space-y-2">
+                  <div className="flex items-center space-x-2">
+                    <span className="text-xs font-mono font-bold px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+                      POLICY 1 (P-T)
+                    </span>
+                    <h3 className="font-semibold text-white text-sm">Trusted Actions Policy (Integrity)</h3>
                   </div>
+                  <p className="text-xs text-slate-300 leading-relaxed">
+                    Blocks consequential tool actions when influenced by untrusted webpage or email content.
+                    Inspired by Microsoft FIDES (Costa et al., 2025).
+                  </p>
+                </div>
+
+                <div className="bg-gradient-to-br from-cyan-950/40 to-slate-900 border border-cyan-900/40 rounded-xl p-5 space-y-2">
+                  <div className="flex items-center space-x-2">
+                    <span className="text-xs font-mono font-bold px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
+                      POLICY 2 (P-F)
+                    </span>
+                    <h3 className="font-semibold text-white text-sm">Permitted Flows Policy (Confidentiality)</h3>
+                  </div>
+                  <p className="text-xs text-slate-300 leading-relaxed">
+                    Prevents confidential documents and API keys from flowing to unauthorized external recipients or leak sites.
+                  </p>
                 </div>
               </div>
 
@@ -307,7 +354,7 @@ export default function App() {
                     <span>Run Full Adversarial Security Test Suite</span>
                   </h3>
                   <p className="text-xs text-slate-400">
-                    Runs 8 deterministic attack vectors (exfiltration, privilege escalation, expired tokens, prompt injection) through the firewall.
+                    Runs 8 deterministic attack vectors verifying Policy 1 (P-T), Policy 2 (P-F), Provable No-Escalation, and Fail-Closed behavior.
                   </p>
                 </div>
                 <button
@@ -341,9 +388,9 @@ export default function App() {
                     <thead className="bg-slate-900/60 text-slate-400 font-mono text-[11px] border-b border-slate-800">
                       <tr>
                         <th className="py-2.5 px-4">Time</th>
-                        <th className="py-2.5 px-4">Agent</th>
+                        <th className="py-2.5 px-4">Policy</th>
                         <th className="py-2.5 px-4">Tool</th>
-                        <th className="py-2.5 px-4">Resource / Dest</th>
+                        <th className="py-2.5 px-4">Target Resource</th>
                         <th className="py-2.5 px-4">Decision</th>
                         <th className="py-2.5 px-4">Policy Reason</th>
                       </tr>
@@ -358,7 +405,11 @@ export default function App() {
                           <td className="py-2.5 px-4 text-slate-400 font-mono">
                             {ev.timestamp.split('T')[1]?.slice(0, 8) || ev.timestamp}
                           </td>
-                          <td className="py-2.5 px-4 font-mono text-cyan-300">{ev.agent_id}</td>
+                          <td className="py-2.5 px-4">
+                            <span className="font-mono text-[10px] font-semibold px-2 py-0.5 rounded bg-indigo-950/80 text-indigo-300 border border-indigo-800/50">
+                              {ev.policy_code || 'P-AUTHZ'}
+                            </span>
+                          </td>
                           <td className="py-2.5 px-4 font-semibold text-slate-200">{ev.tool_name}</td>
                           <td className="py-2.5 px-4 text-slate-400 truncate max-w-[140px]">
                             {ev.resource_or_destination}
@@ -379,13 +430,6 @@ export default function App() {
                           </td>
                         </tr>
                       ))}
-                      {events.length === 0 && (
-                        <tr>
-                          <td colSpan={6} className="text-center py-8 text-slate-500">
-                            No security events recorded yet. Invoke tools via IBM Bob or click "Run Security Tests".
-                          </td>
-                        </tr>
-                      )}
                     </tbody>
                   </table>
                 </div>
@@ -393,17 +437,92 @@ export default function App() {
             </div>
           )}
 
-          {/* TAB 2: LIVE AUDIT FEED */}
+          {/* TAB 2: 25 SECURITY POLICIES BROWSER */}
+          {activeTab === 'policies' && (
+            <div className="space-y-6">
+              <div>
+                <h2 className="text-lg font-bold text-white flex items-center space-x-2">
+                  <Scale className="h-5 w-5 text-amber-400" />
+                  <span>The 25 AI Agent Security Policies</span>
+                </h2>
+                <p className="text-xs text-slate-400">
+                  Comprehensive policy framework enforcing Integrity, Confidentiality, Least Privilege, and Provable Delegation.
+                </p>
+              </div>
+
+              {/* Search and Category Filters */}
+              <div className="flex flex-col md:flex-row gap-3 items-center justify-between">
+                <div className="relative w-full md:w-80">
+                  <Search className="h-4 w-4 text-slate-400 absolute left-3 top-2.5" />
+                  <input
+                    type="text"
+                    placeholder="Search policies (e.g. P-T, Confidentiality)..."
+                    value={policySearch}
+                    onChange={(e) => setPolicySearch(e.target.value)}
+                    className="w-full bg-slate-900 border border-slate-800 rounded-lg pl-9 pr-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-cyan-500"
+                  />
+                </div>
+
+                <div className="flex items-center space-x-1 overflow-x-auto w-full md:w-auto pb-1">
+                  {categories.map((cat) => (
+                    <button
+                      key={cat}
+                      onClick={() => setPolicyCategoryFilter(cat)}
+                      className={`px-2.5 py-1 rounded text-xs font-medium whitespace-nowrap transition ${
+                        policyCategoryFilter === cat
+                          ? 'bg-cyan-600/30 text-cyan-300 border border-cyan-500/40'
+                          : 'text-slate-400 hover:text-white bg-slate-900/60 border border-slate-800'
+                      }`}
+                    >
+                      {cat}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Policies Grid */}
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                {filteredPolicies.map((pol) => (
+                  <div
+                    key={pol.id}
+                    onClick={() => setSelectedPolicy(pol)}
+                    className="bg-[#0e1424] border border-slate-800/90 rounded-xl p-4 space-y-3 hover:border-slate-700 transition cursor-pointer flex flex-col justify-between"
+                  >
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="font-mono text-xs font-bold px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+                          Policy {pol.id} — {pol.code}
+                        </span>
+                        <span className="text-[10px] uppercase font-semibold text-slate-400">
+                          {pol.category}
+                        </span>
+                      </div>
+                      <h4 className="font-semibold text-white text-sm leading-snug">{pol.name}</h4>
+                      <p className="text-xs text-slate-400 leading-relaxed line-clamp-2">
+                        {pol.purpose}
+                      </p>
+                    </div>
+
+                    <div className="pt-2 border-t border-slate-800/60 flex items-center justify-between text-[11px] text-slate-500">
+                      <span>Source: {pol.source_reference.split(' ')[0]}</span>
+                      <span className="text-cyan-400 font-medium">Details →</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* TAB 3: LIVE AUDIT FEED */}
           {activeTab === 'activity' && (
             <div className="space-y-4">
               <div className="flex items-center justify-between">
                 <div>
                   <h2 className="text-lg font-bold text-white">Live Security Audit Log</h2>
                   <p className="text-xs text-slate-400">
-                    Real-time SQLite audit records generated by the AgentShield MCP Firewall.
+                    Real-time SQLite audit records with policy attribution generated by the AgentShield MCP Firewall.
                   </p>
                 </div>
-                {/* Filter Controls */}
                 <div className="flex items-center space-x-2 bg-slate-900 border border-slate-800 p-1 rounded-lg text-xs">
                   <Filter className="h-3.5 w-3.5 text-slate-400 ml-1.5" />
                   {['ALL', 'ALLOWED', 'BLOCKED'].map((type) => (
@@ -428,11 +547,11 @@ export default function App() {
                     <tr>
                       <th className="py-3 px-4">Req ID</th>
                       <th className="py-3 px-4">Timestamp</th>
-                      <th className="py-3 px-4">Agent Identity</th>
+                      <th className="py-3 px-4">Policy Code</th>
                       <th className="py-3 px-4">Tool Requested</th>
                       <th className="py-3 px-4">Target Resource</th>
                       <th className="py-3 px-4">Decision</th>
-                      <th className="py-3 px-4">Downstream Execution</th>
+                      <th className="py-3 px-4">Downstream Status</th>
                       <th className="py-3 px-4">Policy Explanation</th>
                     </tr>
                   </thead>
@@ -447,7 +566,11 @@ export default function App() {
                         <td className="py-2.5 px-4 text-slate-400">
                           {ev.timestamp.split('T')[1]?.slice(0, 8)}
                         </td>
-                        <td className="py-2.5 px-4 text-slate-300">{ev.agent_id}</td>
+                        <td className="py-2.5 px-4 font-sans">
+                          <span className="font-mono text-[10px] font-semibold px-2 py-0.5 rounded bg-indigo-950/80 text-indigo-300 border border-indigo-800/50">
+                            {ev.policy_code || 'P-AUTHZ'}
+                          </span>
+                        </td>
                         <td className="py-2.5 px-4 font-sans font-medium text-white">{ev.tool_name}</td>
                         <td className="py-2.5 px-4 text-slate-400 truncate max-w-[120px]">
                           {ev.resource_or_destination}
@@ -481,27 +604,20 @@ export default function App() {
                         </td>
                       </tr>
                     ))}
-                    {filteredEvents.length === 0 && (
-                      <tr>
-                        <td colSpan={8} className="text-center py-10 text-slate-500 font-sans">
-                          No events match the selected filter.
-                        </td>
-                      </tr>
-                    )}
                   </tbody>
                 </table>
               </div>
             </div>
           )}
 
-          {/* TAB 3: ATTACK TESTING (FUZZER) */}
+          {/* TAB 4: ATTACK TESTING (FUZZER) */}
           {activeTab === 'fuzzer' && (
             <div className="space-y-6">
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
                 <div>
                   <h2 className="text-lg font-bold text-white">Adversarial Security Test Harness</h2>
                   <p className="text-xs text-slate-400">
-                    Runs 8 deterministic security attack scenarios verifying that denied actions never execute downstream.
+                    Runs 8 deterministic attack scenarios verifying that denied actions never execute downstream.
                   </p>
                 </div>
                 <button
@@ -558,7 +674,7 @@ export default function App() {
                           </span>
                           <span className="text-sm font-semibold text-white">{tc.name}</span>
                           <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-indigo-950/60 text-indigo-300 border border-indigo-800/40">
-                            {tc.category}
+                            {tc.policy_code || tc.category}
                           </span>
                         </div>
                         <p className="text-xs text-slate-400">{tc.description}</p>
@@ -605,7 +721,7 @@ export default function App() {
             </div>
           )}
 
-          {/* TAB 4: ARCHITECTURE & IBM BOB INTEGRATION */}
+          {/* TAB 5: ARCHITECTURE & IBM BOB INTEGRATION */}
           {activeTab === 'arch' && (
             <div className="space-y-6">
               <div>
@@ -629,7 +745,7 @@ export default function App() {
                   </div>
                   <div className="bg-cyan-950/40 border border-cyan-700/50 p-4 rounded-lg">
                     <div className="text-xs font-semibold text-cyan-300">3. Policy Engine</div>
-                    <p className="text-[11px] text-slate-400 mt-1">Evaluates whitelist, taints & capabilities</p>
+                    <p className="text-[11px] text-slate-400 mt-1">Evaluates 25 Policies & Attenuation</p>
                   </div>
                   <div className="bg-emerald-950/40 border border-emerald-700/50 p-4 rounded-lg">
                     <div className="text-xs font-semibold text-emerald-300">4. Protected Tool</div>
@@ -669,14 +785,72 @@ export default function App() {
         </main>
       </div>
 
-      {/* Detail Modal for Selected Event */}
+      {/* Modal: Policy Details */}
+      {selectedPolicy && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-[#0f172a] border border-slate-700 rounded-xl max-w-lg w-full p-5 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center space-x-2">
+                <Scale className="h-5 w-5 text-amber-400" />
+                <h3 className="text-sm font-bold text-white">
+                  Policy {selectedPolicy.id}: {selectedPolicy.code}
+                </h3>
+              </div>
+              <button
+                onClick={() => setSelectedPolicy(null)}
+                className="text-slate-400 hover:text-white p-1"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-3 text-xs">
+              <div>
+                <span className="text-slate-400 block mb-0.5">Policy Name:</span>
+                <span className="text-sm font-semibold text-white">{selectedPolicy.name}</span>
+              </div>
+              <div>
+                <span className="text-slate-400 block mb-0.5">Category:</span>
+                <span className="font-semibold text-cyan-400">{selectedPolicy.category}</span>
+              </div>
+              <div>
+                <span className="text-slate-400 block mb-0.5">Formal Purpose:</span>
+                <p className="bg-slate-900 border border-slate-800 p-2.5 rounded text-slate-200 leading-relaxed">
+                  {selectedPolicy.purpose}
+                </p>
+              </div>
+              <div>
+                <span className="text-slate-400 block mb-0.5">Real-World Scenario / Example:</span>
+                <p className="bg-slate-900/60 border border-slate-800 p-2.5 rounded text-slate-300 leading-relaxed">
+                  {selectedPolicy.example}
+                </p>
+              </div>
+              <div>
+                <span className="text-slate-400 block mb-0.5">Research Basis & Citation:</span>
+                <span className="font-mono text-indigo-300">{selectedPolicy.source_reference}</span>
+              </div>
+            </div>
+
+            <div className="pt-2 flex justify-end">
+              <button
+                onClick={() => setSelectedPolicy(null)}
+                className="px-4 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal: Event Details */}
       {selectedEvent && (
         <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-[#0f172a] border border-slate-700 rounded-xl max-w-lg w-full p-5 space-y-4 shadow-2xl">
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
               <div className="flex items-center space-x-2">
                 <Shield className="h-5 w-5 text-cyan-400" />
-                <h3 className="text-sm font-bold text-white">Security Event Details</h3>
+                <h3 className="text-sm font-bold text-white">Security Interception Record</h3>
               </div>
               <button
                 onClick={() => setSelectedEvent(null)}
@@ -692,12 +866,10 @@ export default function App() {
                 <span className="font-mono text-cyan-400">{selectedEvent.request_id}</span>
               </div>
               <div className="flex justify-between">
-                <span className="text-slate-400">Timestamp:</span>
-                <span className="font-mono text-slate-300">{selectedEvent.timestamp}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-400">Agent Identity:</span>
-                <span className="font-mono text-slate-300">{selectedEvent.agent_id}</span>
+                <span className="text-slate-400">Enforced Policy:</span>
+                <span className="font-mono font-semibold text-indigo-300">
+                  {selectedEvent.policy_code || 'P-AUTHZ'}
+                </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-400">Tool Name:</span>
@@ -724,8 +896,8 @@ export default function App() {
                 <span
                   className={
                     selectedEvent.downstream_status === 'EXECUTED'
-                      ? 'text-emerald-400'
-                      : 'text-slate-400'
+                      ? 'text-emerald-400 font-semibold'
+                      : 'text-rose-400 font-semibold'
                   }
                 >
                   {selectedEvent.downstream_status}

@@ -1,6 +1,6 @@
 """
 AgentShield Backend REST API Server
-Provides real-time event streaming, statistics, and on-demand adversarial test execution.
+Provides real-time event streaming, statistics, 25-Policy definitions, and on-demand adversarial test execution.
 Supports both standard library ThreadingHTTPServer (zero external dependencies) and FastAPI/Uvicorn.
 """
 
@@ -11,6 +11,7 @@ import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
+from typing import Any, Dict, List
 
 # Ensure repository root is in sys.path
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -18,6 +19,7 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 from agentshield.backend.app.database import db
+from agentshield.backend.app.core.policies import get_all_policies
 from agentshield.fuzzer.runner import run_test_suite
 from agentshield.mcp_server.server import dispatch_tool
 
@@ -38,7 +40,7 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
-    def _send_json_response(self, status_code: int, data: dict):
+    def _send_json_response(self, status_code: int, data: Any):
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
         self._send_cors_headers()
@@ -70,6 +72,28 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
         elif path == "/api/stats":
             stats = db.get_stats()
             self._send_json_response(200, stats)
+
+        # GET /api/policies
+        elif path == "/api/policies":
+            policies = get_all_policies()
+            stats = db.get_stats()
+            p_breakdown = stats.get("policy_breakdown", {})
+
+            # Enrich each policy with real live enforcement counts
+            enriched = []
+            for p in policies:
+                counts = p_breakdown.get(p["code"], {"allowed": 0, "blocked": 0})
+                enriched.append({
+                    **p,
+                    "allowed_count": counts.get("allowed", 0),
+                    "blocked_count": counts.get("blocked", 0),
+                    "total_enforcements": counts.get("allowed", 0) + counts.get("blocked", 0),
+                })
+
+            self._send_json_response(200, {
+                "count": len(enriched),
+                "policies": enriched,
+            })
 
         # GET /api/events
         elif path == "/api/events":
@@ -125,7 +149,6 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
             self._send_json_response(404, {"error": "Not Found", "path": path})
 
     def log_message(self, format, *args):
-        """Suppress default stdout logging; write to stderr."""
         sys.stderr.write(f"[API Server] {self.address_string()} - {format % args}\n")
 
 
@@ -134,6 +157,7 @@ def run_backend(port: int = 8000, host: str = "127.0.0.1"):
     httpd = ThreadedHTTPServer(server_address, AgentShieldAPIHandler)
     sys.stderr.write(f"\n🚀 AgentShield Security API running at http://{host}:{port}\n")
     sys.stderr.write(f"Health Check: http://{host}:{port}/health\n")
+    sys.stderr.write(f"25 Policies:  http://{host}:{port}/api/policies\n")
     sys.stderr.write(f"Live Events:  http://{host}:{port}/api/events\n")
     sys.stderr.write(f"Real Stats:   http://{host}:{port}/api/stats\n\n")
     try:
@@ -141,44 +165,6 @@ def run_backend(port: int = 8000, host: str = "127.0.0.1"):
     except KeyboardInterrupt:
         sys.stderr.write("\nShutting down backend server...\n")
         httpd.server_close()
-
-
-# Optional FastAPI application interface
-try:
-    from fastapi import FastAPI
-    from fastapi.middleware.cors import CORSMiddleware
-
-    app = FastAPI(title="AgentShield Security Gateway", version="0.1.0")
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    @app.get("/health")
-    def health():
-        return {"status": "healthy", "service": "AgentShield Gateway"}
-
-    @app.get("/api/stats")
-    def get_stats():
-        return db.get_stats()
-
-    @app.get("/api/events")
-    def get_events(limit: int = 50, offset: int = 0):
-        return {"count": len(db.get_recent_events(limit, offset)), "events": db.get_recent_events(limit, offset)}
-
-    @app.get("/api/tests")
-    def get_tests():
-        return db.get_latest_test_run() or {"message": "No tests run yet"}
-
-    @app.post("/api/tests/run")
-    def trigger_tests():
-        return run_test_suite()
-
-except ImportError:
-    app = None
 
 
 if __name__ == "__main__":

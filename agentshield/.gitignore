@@ -38,3 +38,7 @@ frontend/dist/
 .vscode/
 *.swp
 *.swo
+
+# SQLite temporary files
+*.db-wal
+*.db-shm

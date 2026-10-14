@@ -39,5 +39,6 @@ frontend/dist/
 *.swp
 *.swo
 
-# Mock logs (optional / keep mock definitions)
-# data/mock_executions.jsonl
+# SQLite temporary files
+*.db-wal
+*.db-shm

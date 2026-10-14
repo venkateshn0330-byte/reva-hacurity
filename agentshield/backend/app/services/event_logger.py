@@ -1,6 +1,7 @@
 """
 AgentShield Event Logger Service
 Wraps database persistence for security decisions and tool executions.
+Attaches 25-Policy attribution to every audit record.
 """
 
 import os
@@ -28,15 +29,7 @@ def log_decision(
     request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Log an authorization decision to SQLite.
-    
-    Args:
-        agent_id: The asserted agent caller identity.
-        tool_name: Name of tool requested.
-        arguments: Tool invocation arguments.
-        decision: Decision dict containing 'allowed', 'reason', 'risk_level'.
-        downstream_status: "EXECUTED" or "BLOCKED".
-        request_id: Unique request identifier.
+    Log an authorization decision to SQLite with full 25-Policy attribution.
     """
     if not request_id:
         request_id = f"req-{uuid.uuid4().hex[:10]}"
@@ -49,6 +42,9 @@ def log_decision(
         or "N/A"
     )
 
+    policy_id = decision.get("policy_id", 14)
+    policy_code = decision.get("policy_code", "P-AUTHZ")
+
     return db.log_security_event(
         request_id=request_id,
         agent_id=agent_id,
@@ -59,6 +55,8 @@ def log_decision(
         reason=decision.get("reason", ""),
         risk_level=decision.get("risk_level", "HIGH"),
         downstream_status=downstream_status,
+        policy_id=policy_id,
+        policy_code=policy_code,
         timestamp=decision.get("timestamp"),
     )
 

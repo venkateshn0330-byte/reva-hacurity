@@ -2,6 +2,7 @@
 AgentShield SQLite Event Store & Audit Database.
 Provides thread-safe, concurrent access to security audit records and mock executions.
 Shared between the MCP STDIO server, the FastAPI/REST backend, and the adversarial fuzzer.
+Records policy_id and policy_code across all 25 AI Agent Security Policies.
 """
 
 from datetime import datetime, timezone
@@ -24,7 +25,6 @@ def get_db_connection() -> sqlite3.Connection:
     os.makedirs(DATA_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
-    # Enable Write-Ahead Logging for high-concurrency between MCP server and Backend
     try:
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA busy_timeout = 5000;")
@@ -52,7 +52,9 @@ def init_db() -> None:
                         allowed INTEGER NOT NULL,
                         reason TEXT NOT NULL,
                         risk_level TEXT NOT NULL,
-                        downstream_status TEXT NOT NULL
+                        downstream_status TEXT NOT NULL,
+                        policy_id INTEGER DEFAULT 14,
+                        policy_code TEXT DEFAULT 'P-AUTHZ'
                     );
                     """
                 )
@@ -82,6 +84,16 @@ def init_db() -> None:
                     );
                     """
                 )
+
+                # Migration check: ensure policy columns exist if table was created previously
+                try:
+                    conn.execute("ALTER TABLE security_events ADD COLUMN policy_id INTEGER DEFAULT 14;")
+                except Exception:
+                    pass
+                try:
+                    conn.execute("ALTER TABLE security_events ADD COLUMN policy_code TEXT DEFAULT 'P-AUTHZ';")
+                except Exception:
+                    pass
         finally:
             conn.close()
 
@@ -96,6 +108,8 @@ def log_security_event(
     reason: str,
     risk_level: str,
     downstream_status: str,
+    policy_id: int = 14,
+    policy_code: str = "P-AUTHZ",
     timestamp: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
@@ -105,7 +119,7 @@ def log_security_event(
     if timestamp is None:
         timestamp = datetime.now(timezone.utc).isoformat()
 
-    # Redact potential secrets in arguments before logging
+    # Redact potential secrets in arguments before logging (Policy 12: Secret Protection)
     safe_args = {}
     for k, v in arguments.items():
         if k in ("password", "secret", "token", "api_key", "credential"):
@@ -126,6 +140,8 @@ def log_security_event(
         "reason": reason,
         "risk_level": risk_level,
         "downstream_status": downstream_status,
+        "policy_id": policy_id,
+        "policy_code": policy_code,
     }
 
     with _lock:
@@ -137,11 +153,11 @@ def log_security_event(
                     INSERT INTO security_events (
                         request_id, timestamp, agent_id, tool_name,
                         resource_or_destination, arguments_json, allowed,
-                        reason, risk_level, downstream_status
+                        reason, risk_level, downstream_status, policy_id, policy_code
                     ) VALUES (
                         :request_id, :timestamp, :agent_id, :tool_name,
                         :resource_or_destination, :arguments_json, :allowed,
-                        :reason, :risk_level, :downstream_status
+                        :reason, :risk_level, :downstream_status, :policy_id, :policy_code
                     )
                     """,
                     record,
@@ -199,7 +215,7 @@ def get_recent_events(limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
                 """
                 SELECT id, request_id, timestamp, agent_id, tool_name,
                        resource_or_destination, arguments_json, allowed,
-                       reason, risk_level, downstream_status
+                       reason, risk_level, downstream_status, policy_id, policy_code
                 FROM security_events
                 ORDER BY id DESC
                 LIMIT ? OFFSET ?
@@ -221,6 +237,8 @@ def get_recent_events(limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
                     "reason": r["reason"],
                     "risk_level": r["risk_level"],
                     "downstream_status": r["downstream_status"],
+                    "policy_id": r["policy_id"] if "policy_id" in r.keys() else 14,
+                    "policy_code": r["policy_code"] if "policy_code" in r.keys() else "P-AUTHZ",
                 })
             return events
         finally:
@@ -256,12 +274,34 @@ def get_stats() -> Dict[str, Any]:
                 else:
                     tool_breakdown[t]["blocked"] = row["cnt"]
 
+            # Policy enforcement breakdown
+            policy_breakdown = {}
+            try:
+                p_cursor = conn.execute(
+                    """
+                    SELECT policy_code, allowed, COUNT(*) as cnt
+                    FROM security_events
+                    GROUP BY policy_code, allowed
+                    """
+                )
+                for row in p_cursor.fetchall():
+                    pcode = row["policy_code"] or "P-AUTHZ"
+                    if pcode not in policy_breakdown:
+                        policy_breakdown[pcode] = {"allowed": 0, "blocked": 0}
+                    if row["allowed"]:
+                        policy_breakdown[pcode]["allowed"] = row["cnt"]
+                    else:
+                        policy_breakdown[pcode]["blocked"] = row["cnt"]
+            except Exception:
+                pass
+
             return {
                 "total_requests": total,
                 "allowed_requests": allowed,
                 "blocked_requests": blocked,
                 "tests_completed": tests_run,
                 "tool_breakdown": tool_breakdown,
+                "policy_breakdown": policy_breakdown,
                 "database_path": DB_PATH,
             }
         finally:
