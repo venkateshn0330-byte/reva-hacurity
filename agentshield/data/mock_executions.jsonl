@@ -1,0 +1,1 @@
+{"execution_id": "exec-daf95254", "action_type": "read_document", "arguments": {"document_id": "doc_sample_001"}, "agent_id": "demo-agent", "result_summary": {"document_id": "doc_sample_001", "status": "success"}, "timestamp": "2026-10-14T07:44:23.636420+00:00"}

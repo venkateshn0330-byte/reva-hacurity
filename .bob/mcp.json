@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "agentshield": {
+      "command": "python3",
+      "args": [
+        "/Users/ashwinshetty/Desktop/hackcurity/agentshield/mcp_server/server.py"
+      ],
+      "cwd": "/Users/ashwinshetty/Desktop/hackcurity/agentshield",
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      },
+      "alwaysAllow": [
+        "read_document"
+      ],
+      "disabled": false,
+      "protocolNegotiation": "legacy"
+    }
+  }
+}
