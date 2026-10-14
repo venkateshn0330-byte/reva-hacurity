@@ -1,0 +1,3 @@
+# AgentShield Backend Requirements
+# Built purely with Python 3.10+ Standard Library (http.server, sqlite3, hashlib, hmac, secrets, etc.)
+# No external pip dependencies required.

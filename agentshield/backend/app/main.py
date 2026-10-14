@@ -52,7 +52,11 @@ ALLOWED_HOSTS = set(filter(None, [
 
 
 def is_production_mode() -> bool:
-    return os.environ.get("AGENTSHIELD_ENV", "development").lower() in ("production", "prod")
+    return (
+        os.environ.get("AGENTSHIELD_ENV", "development").lower() in ("production", "prod")
+        or bool(os.environ.get("RENDER"))
+        or bool(os.environ.get("DYNO"))
+    )
 
 
 def is_dev_mode_enabled() -> bool:
@@ -65,10 +69,12 @@ def is_dev_mode_enabled() -> bool:
 def is_allowed_origin(origin: str) -> bool:
     if not origin:
         return False
-    if origin in ALLOWED_ORIGINS:
+    if "*" in ALLOWED_ORIGINS or origin in ALLOWED_ORIGINS:
+        return True
+    parsed = urlparse(origin)
+    if parsed.hostname and (parsed.hostname.endswith(".onrender.com") or parsed.hostname.endswith(".render.com")):
         return True
     if not is_production_mode():
-        parsed = urlparse(origin)
         if parsed.hostname in ("127.0.0.1", "localhost", "::1"):
             return True
     return False
@@ -79,6 +85,10 @@ def validate_host_header(handler: BaseHTTPRequestHandler) -> bool:
     if not host_header:
         return True
     host_name = host_header.split(":")[0]
+    if "*" in ALLOWED_HOSTS:
+        return True
+    if host_name.endswith(".onrender.com") or host_name.endswith(".render.com"):
+        return True
     return (host_name in ALLOWED_HOSTS) or (host_name in ("127.0.0.1", "localhost", "::1", "testclient"))
 
 
@@ -1326,7 +1336,11 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
         sys.stderr.write(f"[{ts}] [AgentShield] {self.address_string()} - {format % args}\n")
 
 
-def run_backend(port: int = 8000, host: str = "127.0.0.1"):
+def run_backend(port: int = None, host: str = None):
+    if host is None:
+        host = os.environ.get("HOST", "0.0.0.0")
+    if port is None:
+        port = int(os.environ.get("PORT", "8000"))
     server_address = (host, port)
     httpd = ThreadedHTTPServer(server_address, AgentShieldAPIHandler)
     sys.stderr.write(f"\n🚀 AgentShield Security API running at http://{host}:{port}\n")
@@ -1342,4 +1356,7 @@ def run_backend(port: int = 8000, host: str = "127.0.0.1"):
 
 
 if __name__ == "__main__":
-    run_backend(port=8000)
+    env_port = int(os.environ.get("PORT", "8000"))
+    env_host = os.environ.get("HOST", "0.0.0.0")
+    run_backend(port=env_port, host=env_host)
+
