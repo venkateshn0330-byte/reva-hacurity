@@ -2,21 +2,25 @@
 AgentShield MCP Protected Tools (Safe Mock Operations)
 These mock implementations execute ONLY when authorized by the security gateway.
 They never send real emails, touch production systems, or expose real secrets.
-Mock execution records are saved in memory and logged to disk for audit/testing verification.
+Mock execution records are saved in memory, logged to disk, and written to SQLite for audit/testing verification.
 """
 
 from datetime import datetime, timezone
 import json
 import os
-from typing import Any, Dict, List
+import sys
+from typing import Any, Dict, List, Optional
 import uuid
 
 # In-memory execution log for fast test verification
 _MOCK_EXECUTION_RECORDS: List[Dict[str, Any]] = []
 
 # Persistent file log path for mock executions
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+DATA_DIR = os.path.join(BASE_DIR, "agentshield", "data")
 LOG_FILE_PATH = os.path.join(DATA_DIR, "mock_executions.jsonl")
 
 # Safe mock document storage
@@ -47,7 +51,7 @@ MOCK_DOCUMENTS = {
         "content": (
             "Milestone 1: FastMCP STDIO Gateway and Reusable Policy Engine.\n"
             "Milestone 2: SQLite Security Event Bus and React Cybersecurity Console.\n"
-            "Milestone 3: Biscuit Capability Tokens and Z3 Invariant Enforcement."
+            "Milestone 3: Delegated Capability Enforcement and Taint-aware Flow Control."
         ),
     },
     "public_quarterly_report.txt": {
@@ -60,7 +64,7 @@ MOCK_DOCUMENTS = {
 
 
 def _record_execution(action_type: str, arguments: Dict[str, Any], agent_id: str, result_summary: Dict[str, Any]) -> Dict[str, Any]:
-    """Record that a mock tool operation actually ran."""
+    """Record that a mock tool operation actually ran into memory, JSONL, and SQLite."""
     record = {
         "execution_id": f"exec-{uuid.uuid4().hex[:8]}",
         "action_type": action_type,
@@ -72,13 +76,26 @@ def _record_execution(action_type: str, arguments: Dict[str, Any], agent_id: str
     
     _MOCK_EXECUTION_RECORDS.append(record)
 
-    # Persist record to jsonl file
+    # 1. Persist record to jsonl file
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         with open(LOG_FILE_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
     except Exception:
-        # In-memory record is still preserved even if file write fails
+        pass
+
+    # 2. Persist to SQLite mock_executions table
+    try:
+        from agentshield.backend.app.database import db
+        db.log_mock_execution(
+            execution_id=record["execution_id"],
+            action_type=action_type,
+            agent_id=agent_id,
+            arguments=arguments,
+            result_summary=result_summary,
+            timestamp=record["timestamp"],
+        )
+    except Exception:
         pass
 
     return record
@@ -158,16 +175,22 @@ def execute_send_email(recipient: str, subject: str, body: str, agent_id: str = 
     return result
 
 
-def execute_export_data(document_id: str, destination: str, agent_id: str = "demo-agent") -> Dict[str, Any]:
+def execute_export_data(
+    document_id: Optional[str] = None,
+    destination: str = "",
+    agent_id: str = "demo-agent",
+    resource_id: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Mock implementation of data export tool.
-    Simulates a safe mock export transfer without touching external infrastructure.
+    Supports either document_id or resource_id for parameter compatibility.
     """
+    target_id = resource_id or document_id or "unknown_resource"
     export_id = f"export-{uuid.uuid4().hex[:8]}"
     result = {
         "status": "mock_exported",
         "export_id": export_id,
-        "document_id": document_id,
+        "document_id": target_id,
         "destination": destination,
         "bytes_transferred": 1024,
         "simulated": True,
@@ -176,9 +199,9 @@ def execute_export_data(document_id: str, destination: str, agent_id: str = "dem
 
     _record_execution(
         action_type="export_data",
-        arguments={"document_id": document_id, "destination": destination},
+        arguments={"document_id": target_id, "destination": destination},
         agent_id=agent_id,
-        result_summary={"document_id": document_id, "destination": destination, "export_id": export_id},
+        result_summary={"document_id": target_id, "destination": destination, "export_id": export_id},
     )
 
     return result

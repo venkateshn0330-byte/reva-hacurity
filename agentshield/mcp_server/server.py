@@ -7,8 +7,9 @@ Key Capabilities & Guarantees:
    - Supports Bob specification versions: 2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05, 2024-10-07.
    - Responds to 'server/discover' probes (for auto-negotiation) and direct 'initialize' (for legacy mode).
 2. Intercepts all tool operations (read_document, send_email, export_data) with policy.authorize().
-3. Never prints to STDOUT (STDIO used solely for JSON-RPC 2.0 framing). Diagnostics go strictly to STDERR.
-4. Provides rich, unambiguous tool and parameter schemas so Bob's AI model accurately reasons over tools.
+3. Denied operations NEVER execute downstream mock tools.
+4. Records every decision and mock execution into the shared SQLite audit database (data/events.db).
+5. Never prints to STDOUT (STDIO used solely for JSON-RPC 2.0 framing). Diagnostics go strictly to STDERR.
 """
 
 import json
@@ -17,13 +18,19 @@ import os
 import sys
 from typing import Any, Dict, Optional
 
-# Add mcp_server directory to sys.path if not present
+# Add mcp_server and repository directory to sys.path
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-if CURRENT_DIR not in sys.path:
-    sys.path.insert(0, CURRENT_DIR)
+REPO_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))
+for p in [CURRENT_DIR, REPO_ROOT]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
-from policy import authorize
-import protected_tools
+try:
+    from agentshield.mcp_server.policy import authorize
+    from agentshield.mcp_server import protected_tools
+except ImportError:
+    from policy import authorize
+    import protected_tools
 
 # Configure logging strictly to sys.stderr so stdout remains 100% clean JSON-RPC
 logging.basicConfig(
@@ -67,6 +74,10 @@ TOOLS_MANIFEST = [
                         "Identifier of the document to retrieve. Examples: 'doc_sample_001', "
                         "'doc_public_overview', 'doc_public_roadmap'. Cannot contain 'confidential' or 'secret'."
                     ),
+                },
+                "resource_id": {
+                    "type": "string",
+                    "description": "Alias for document_id.",
                 },
                 "agent_id": {
                     "type": "string",
@@ -127,6 +138,10 @@ TOOLS_MANIFEST = [
                     "type": "string",
                     "description": "Identifier of the document to export. Must be in the approved document whitelist.",
                 },
+                "resource_id": {
+                    "type": "string",
+                    "description": "Alias for document_id.",
+                },
                 "destination": {
                     "type": "string",
                     "description": (
@@ -146,13 +161,26 @@ TOOLS_MANIFEST = [
 ]
 
 
+def _safe_log_event(agent_id: str, tool_name: str, arguments: Dict[str, Any], decision: Dict[str, Any], downstream_status: str):
+    """Safely log event to SQLite without throwing exceptions to caller."""
+    try:
+        from agentshield.backend.app.services.event_logger import log_decision
+        log_decision(
+            agent_id=agent_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            decision=decision,
+            downstream_status=downstream_status,
+        )
+    except Exception as err:
+        logger.warning(f"Could not write audit log to SQLite: {err}")
+
+
 def dispatch_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """
     Core security gateway dispatcher.
     Enforces authorization check BEFORE executing any protected tool.
-    
-    Returns:
-        MCP Result dictionary formatted with 'content' and 'isError'.
+    Logs every decision to the SQLite audit database.
     """
     agent_id = arguments.get("agent_id", "demo-agent")
     logger.info(f"INCOMING REQUEST: tool='{tool_name}', agent='{agent_id}', args={json.dumps(arguments)}")
@@ -166,6 +194,16 @@ def dispatch_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         logger.warning(
             f"SECURITY GATEWAY BLOCKED: tool='{tool_name}' agent='{agent_id}' risk={risk} reason='{reason}'"
         )
+        
+        # Log blocked event to SQLite
+        _safe_log_event(
+            agent_id=agent_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            decision=decision,
+            downstream_status="BLOCKED",
+        )
+
         return {
             "content": [
                 {
@@ -189,7 +227,7 @@ def dispatch_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     logger.info(f"SECURITY GATEWAY PERMITTED: tool='{tool_name}' agent='{agent_id}'")
     try:
         if tool_name == "read_document":
-            doc_id = arguments.get("document_id")
+            doc_id = arguments.get("document_id") or arguments.get("resource_id")
             result = protected_tools.execute_read_document(document_id=doc_id, agent_id=agent_id)
         elif tool_name == "send_email":
             recipient = arguments.get("recipient")
@@ -199,7 +237,7 @@ def dispatch_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
                 recipient=recipient, subject=subject, body=body, agent_id=agent_id
             )
         elif tool_name == "export_data":
-            doc_id = arguments.get("document_id")
+            doc_id = arguments.get("document_id") or arguments.get("resource_id")
             destination = arguments.get("destination")
             result = protected_tools.execute_export_data(
                 document_id=doc_id, destination=destination, agent_id=agent_id
@@ -209,6 +247,15 @@ def dispatch_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
                 "content": [{"type": "text", "text": f"Error: Tool '{tool_name}' not implemented."}],
                 "isError": True,
             }
+
+        # Log allowed execution to SQLite
+        _safe_log_event(
+            agent_id=agent_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            decision=decision,
+            downstream_status="EXECUTED",
+        )
 
         return {
             "content": [
@@ -222,6 +269,13 @@ def dispatch_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         }
     except Exception as e:
         logger.error(f"Execution failure in tool '{tool_name}': {e}", exc_info=True)
+        _safe_log_event(
+            agent_id=agent_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            decision=decision,
+            downstream_status="FAILED",
+        )
         return {
             "content": [{"type": "text", "text": f"Tool execution failed: {str(e)}"}],
             "isError": True,
@@ -229,9 +283,7 @@ def dispatch_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def handle_jsonrpc_message(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Process a single JSON-RPC 2.0 message conforming to the MCP specification and IBM Bob client.
-    """
+    """Process a single JSON-RPC 2.0 message conforming to the MCP specification and IBM Bob client."""
     msg_id = message.get("id")
     method = message.get("method")
     params = message.get("params", {})
@@ -252,7 +304,6 @@ def handle_jsonrpc_message(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     # 2. MCP Handshake / Initialization
     elif method == "initialize":
         requested_version = params.get("protocolVersion")
-        # Negotiate version: use requested version if in supported list, else fallback to default
         if requested_version in SUPPORTED_PROTOCOL_VERSIONS:
             negotiated_version = requested_version
         else:
@@ -273,7 +324,7 @@ def handle_jsonrpc_message(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             },
         }
 
-    # 3. Initialized Notification (notification: must return None, no response)
+    # 3. Initialized Notification (no response required)
     elif method == "notifications/initialized":
         logger.info("Bob client completed initialization handshake.")
         return None
@@ -302,7 +353,6 @@ def handle_jsonrpc_message(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         arguments = params.get("arguments", {})
         execution_result = dispatch_tool(tool_name=tool_name, arguments=arguments)
 
-        # Wire format returned to Bob client
         wire_result = {
             "content": execution_result["content"],
             "isError": execution_result["isError"],
@@ -315,7 +365,6 @@ def handle_jsonrpc_message(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     # Handle unknown method / notifications
     else:
-        # If message has no id, it is a notification (do not send response)
         if msg_id is None:
             logger.info(f"Ignored unknown notification: '{method}'")
             return None
@@ -354,7 +403,6 @@ def run_stdio_server():
 
         resp = handle_jsonrpc_message(req)
         if resp is not None:
-            # Newline-delimited JSON-RPC to stdout, flushed immediately
             sys.stdout.write(json.dumps(resp) + "\n")
             sys.stdout.flush()
 

@@ -43,11 +43,12 @@ CONFIDENTIAL_PATTERNS = [
     re.compile(r"credential", re.IGNORECASE),
     re.compile(r"token", re.IGNORECASE),
     re.compile(r"key", re.IGNORECASE),
+    re.compile(r"password", re.IGNORECASE),
 ]
 
 
 def _is_confidential_identifier(identifier: str) -> bool:
-    """Check if a document or file identifier indicates confidential content."""
+    """Check if an identifier indicates confidential content."""
     if not identifier:
         return False
     return any(pattern.search(identifier) for pattern in CONFIDENTIAL_PATTERNS)
@@ -75,7 +76,7 @@ def authorize(tool_name: str, arguments: Dict[str, Any], agent_id: str = "demo-a
         arguments: The arguments provided to the tool.
         agent_id: Configured test identity claiming to make the call.
                   NOTE: agent_id is an asserted test identity, NOT a cryptographically
-                  verified identity. Full delegation tokens (e.g., Biscuit) will be added later.
+                  verified identity.
                   
     Returns:
         Structured decision dictionary:
@@ -94,17 +95,17 @@ def authorize(tool_name: str, arguments: Dict[str, Any], agent_id: str = "demo-a
         "tool_name": tool_name,
         "agent_id": agent_id,
         "timestamp": now,
-        "identity_status": "UNVERIFIED_ASSERTED",  # Explicitly documented limitation
+        "identity_status": "UNVERIFIED_ASSERTED",
     }
 
     # 1. READ_DOCUMENT Policy
     if tool_name == "read_document":
-        doc_id = str(arguments.get("document_id", "")).strip()
+        doc_id = str(arguments.get("document_id") or arguments.get("resource_id") or "").strip()
         if not doc_id:
             return {
                 **base_decision,
                 "allowed": False,
-                "reason": "Missing required argument 'document_id'.",
+                "reason": "Missing required argument 'document_id' (or 'resource_id').",
                 "risk_level": "LOW",
             }
         
@@ -175,14 +176,14 @@ def authorize(tool_name: str, arguments: Dict[str, Any], agent_id: str = "demo-a
 
     # 3. EXPORT_DATA Policy
     elif tool_name == "export_data":
-        doc_id = str(arguments.get("document_id", "")).strip()
+        doc_id = str(arguments.get("document_id") or arguments.get("resource_id") or "").strip()
         destination = str(arguments.get("destination", "")).strip()
 
         if not doc_id or not destination:
             return {
                 **base_decision,
                 "allowed": False,
-                "reason": "Missing required arguments 'document_id' or 'destination'.",
+                "reason": "Missing required arguments 'document_id' (or 'resource_id') and 'destination'.",
                 "risk_level": "LOW",
             }
 
