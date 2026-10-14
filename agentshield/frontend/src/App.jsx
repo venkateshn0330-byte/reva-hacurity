@@ -36,7 +36,17 @@ import {
   Globe
 } from 'lucide-react';
 
-const API_BASE = 'http://127.0.0.1:8000';
+const getApiBase = () => {
+  if (typeof window === 'undefined') return 'http://127.0.0.1:8000';
+  if (import.meta.env?.VITE_API_BASE) return import.meta.env.VITE_API_BASE;
+  const { protocol, hostname } = window.location;
+  if (hostname === 'localhost' || hostname === '127.0.0.1') {
+    return `${protocol}//${hostname}:8000`;
+  }
+  return window.location.origin;
+};
+
+const API_BASE = getApiBase();
 
 export default function App() {
   // Global Dashboard & Security State
@@ -85,6 +95,21 @@ export default function App() {
   const [testingUpstream, setTestingUpstream] = useState(false);
   const [upstreamStatusMsg, setUpstreamStatusMsg] = useState(null);
 
+  // Helper to extract session and CSRF tokens for state-changing or authenticated calls
+  const getAuthHeaders = (includeCsrf = false) => {
+    const headers = {};
+    const token = session?.session_token || localStorage.getItem('agentshield_session_token');
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+      headers['X-Session-Token'] = token;
+    }
+    const csrf = session?.csrf_token || localStorage.getItem('agentshield_csrf_token');
+    if (includeCsrf && csrf) {
+      headers['X-CSRF-Token'] = csrf;
+    }
+    return headers;
+  };
+
   // Ensure Developer Session & Fetch Core Data
   const ensureSessionAndFetchData = async (targetProjectId = null) => {
     setRefreshing(true);
@@ -99,7 +124,13 @@ export default function App() {
       }
 
       // 2. Developer Session verification / automatic bootstrap
-      let sessionRes = await fetch(`${API_BASE}/api/auth/session`, { credentials: 'include' }).catch(() => null);
+      const storedToken = localStorage.getItem('agentshield_session_token');
+      const initialHeaders = storedToken ? { 'Authorization': `Bearer ${storedToken}`, 'X-Session-Token': storedToken } : {};
+
+      let sessionRes = await fetch(`${API_BASE}/api/auth/session`, { 
+        headers: initialHeaders,
+        credentials: 'include' 
+      }).catch(() => null);
       let sessionData = sessionRes && sessionRes.ok ? await sessionRes.json() : null;
 
       if (!sessionData || !sessionData.authenticated) {
@@ -112,15 +143,40 @@ export default function App() {
         }).catch(() => null);
 
         if (loginRes && loginRes.ok) {
-          sessionRes = await fetch(`${API_BASE}/api/auth/session`, { credentials: 'include' }).catch(() => null);
+          const loginData = await loginRes.json();
+          if (loginData?.session_token) {
+            localStorage.setItem('agentshield_session_token', loginData.session_token);
+          }
+          if (loginData?.csrf_token) {
+            localStorage.setItem('agentshield_csrf_token', loginData.csrf_token);
+          }
+          sessionRes = await fetch(`${API_BASE}/api/auth/session`, { 
+            headers: loginData?.session_token ? { 
+              'Authorization': `Bearer ${loginData.session_token}`,
+              'X-Session-Token': loginData.session_token
+            } : {},
+            credentials: 'include' 
+          }).catch(() => null);
           sessionData = sessionRes && sessionRes.ok ? await sessionRes.json() : null;
         }
       }
+
+      if (sessionData && sessionData.authenticated) {
+        if (sessionData.session_token) localStorage.setItem('agentshield_session_token', sessionData.session_token);
+        if (sessionData.csrf_token) localStorage.setItem('agentshield_csrf_token', sessionData.csrf_token);
+      }
       setSession(sessionData);
+
+      const activeAuthHeaders = sessionData?.session_token 
+        ? { 'Authorization': `Bearer ${sessionData.session_token}`, 'X-Session-Token': sessionData.session_token }
+        : initialHeaders;
 
       // 3. Projects List
       let currentProjId = targetProjectId || selectedProjectId;
-      const projectsRes = await fetch(`${API_BASE}/api/projects`, { credentials: 'include' }).catch(() => null);
+      const projectsRes = await fetch(`${API_BASE}/api/projects`, { 
+        headers: activeAuthHeaders,
+        credentials: 'include' 
+      }).catch(() => null);
       if (projectsRes && projectsRes.ok) {
         const pList = await projectsRes.json();
         const projs = pList.projects || [];
@@ -133,7 +189,10 @@ export default function App() {
 
       // 4. Scoped Stats for Selected Project
       const statsUrl = currentProjId ? `${API_BASE}/api/stats?project_id=${currentProjId}` : `${API_BASE}/api/stats`;
-      const statsRes = await fetch(statsUrl, { credentials: 'include' }).catch(() => null);
+      const statsRes = await fetch(statsUrl, { 
+        headers: activeAuthHeaders,
+        credentials: 'include' 
+      }).catch(() => null);
       if (statsRes && statsRes.ok) {
         const sData = await statsRes.json();
         setStats(sData);
@@ -141,13 +200,19 @@ export default function App() {
 
       // 5. Scoped Policies for Selected Project
       const policiesUrl = currentProjId ? `${API_BASE}/api/projects/${currentProjId}/policies` : `${API_BASE}/api/policies`;
-      const policiesRes = await fetch(policiesUrl, { credentials: 'include' }).catch(() => null);
+      const policiesRes = await fetch(policiesUrl, { 
+        headers: activeAuthHeaders,
+        credentials: 'include' 
+      }).catch(() => null);
       if (policiesRes && policiesRes.ok) {
         const pData = await policiesRes.json();
         setPolicies(pData.policies || []);
       } else {
         // Fallback to global policies if project-specific route fails
-        const fallbackRes = await fetch(`${API_BASE}/api/policies`, { credentials: 'include' }).catch(() => null);
+        const fallbackRes = await fetch(`${API_BASE}/api/policies`, { 
+          headers: activeAuthHeaders,
+          credentials: 'include' 
+        }).catch(() => null);
         if (fallbackRes && fallbackRes.ok) {
           const fbData = await fallbackRes.json();
           setPolicies(fbData.policies || []);
@@ -156,7 +221,10 @@ export default function App() {
 
       // 6. Scoped Events for Selected Project
       const eventsUrl = currentProjId ? `${API_BASE}/api/projects/${currentProjId}/events?limit=50` : `${API_BASE}/api/events?limit=50`;
-      const eventsRes = await fetch(eventsUrl, { credentials: 'include' }).catch(() => null);
+      const eventsRes = await fetch(eventsUrl, { 
+        headers: activeAuthHeaders,
+        credentials: 'include' 
+      }).catch(() => null);
       if (eventsRes && eventsRes.ok) {
         const eData = await eventsRes.json();
         setEvents(eData.events || []);
@@ -164,21 +232,30 @@ export default function App() {
 
       // 7. Developer Connect Metadata
       if (currentProjId) {
-        const connectRes = await fetch(`${API_BASE}/api/projects/${currentProjId}/connect`, { credentials: 'include' }).catch(() => null);
+        const connectRes = await fetch(`${API_BASE}/api/projects/${currentProjId}/connect`, { 
+          headers: activeAuthHeaders,
+          credentials: 'include' 
+        }).catch(() => null);
         if (connectRes && connectRes.ok) {
           const cData = await connectRes.json();
           setConnectInfo(cData);
         }
 
         // 8. Credentials List (Masked)
-        const credsRes = await fetch(`${API_BASE}/api/projects/${currentProjId}/credentials`, { credentials: 'include' }).catch(() => null);
+        const credsRes = await fetch(`${API_BASE}/api/projects/${currentProjId}/credentials`, { 
+          headers: activeAuthHeaders,
+          credentials: 'include' 
+        }).catch(() => null);
         if (credsRes && credsRes.ok) {
           const credData = await credsRes.json();
           setCredentials(credData.credentials || []);
         }
 
         // 8.5 Upstream Server Proxy Configuration
-        const upstreamRes = await fetch(`${API_BASE}/api/projects/${currentProjId}/upstream`, { credentials: 'include' }).catch(() => null);
+        const upstreamRes = await fetch(`${API_BASE}/api/projects/${currentProjId}/upstream`, { 
+          headers: activeAuthHeaders,
+          credentials: 'include' 
+        }).catch(() => null);
         if (upstreamRes && upstreamRes.ok) {
           const upData = await upstreamRes.json();
           setUpstreamInfo(upData);
@@ -188,7 +265,10 @@ export default function App() {
       }
 
       // 9. Tests run status
-      const testsRes = await fetch(`${API_BASE}/api/tests`, { credentials: 'include' }).catch(() => null);
+      const testsRes = await fetch(`${API_BASE}/api/tests`, { 
+        headers: activeAuthHeaders,
+        credentials: 'include' 
+      }).catch(() => null);
       if (testsRes && testsRes.ok) {
         const tData = await testsRes.json();
         if (tData && tData.total_tests) {
@@ -224,7 +304,7 @@ export default function App() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...(session?.csrf_token ? { 'X-CSRF-Token': session.csrf_token } : {})
+          ...getAuthHeaders(true)
         },
         body: JSON.stringify({ name: newProjectName.trim() }),
         credentials: 'include'
@@ -258,7 +338,7 @@ export default function App() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...(session?.csrf_token ? { 'X-CSRF-Token': session.csrf_token } : {})
+          ...getAuthHeaders(true)
         },
         body: JSON.stringify({ agent_id: agentId, role: 'agent' }),
         credentials: 'include'
@@ -269,7 +349,10 @@ export default function App() {
         setShowKeyModal(false);
         setNewKeyAgentId('');
         // Refresh masked credential list
-        const listRes = await fetch(`${API_BASE}/api/projects/${selectedProjectId}/credentials`, { credentials: 'include' });
+        const listRes = await fetch(`${API_BASE}/api/projects/${selectedProjectId}/credentials`, { 
+          headers: getAuthHeaders(false),
+          credentials: 'include' 
+        });
         if (listRes.ok) {
           const listData = await listRes.json();
           setCredentials(listData.credentials || []);
@@ -293,11 +376,14 @@ export default function App() {
     try {
       const res = await fetch(`${API_BASE}/api/projects/${selectedProjectId}/credentials/${keyId}/revoke`, {
         method: 'POST',
-        headers: session?.csrf_token ? { 'X-CSRF-Token': session.csrf_token } : {},
+        headers: getAuthHeaders(true),
         credentials: 'include'
       });
       if (res.ok) {
-        const listRes = await fetch(`${API_BASE}/api/projects/${selectedProjectId}/credentials`, { credentials: 'include' });
+        const listRes = await fetch(`${API_BASE}/api/projects/${selectedProjectId}/credentials`, { 
+          headers: getAuthHeaders(false),
+          credentials: 'include' 
+        });
         if (listRes.ok) {
           const listData = await listRes.json();
           setCredentials(listData.credentials || []);
@@ -318,13 +404,16 @@ export default function App() {
     try {
       const res = await fetch(`${API_BASE}/api/projects/${selectedProjectId}/credentials/${keyId}/rotate`, {
         method: 'POST',
-        headers: session?.csrf_token ? { 'X-CSRF-Token': session.csrf_token } : {},
+        headers: getAuthHeaders(true),
         credentials: 'include'
       });
       if (res.ok) {
         const newCred = await res.json();
         setNewlyCreatedKey(newCred);
-        const listRes = await fetch(`${API_BASE}/api/projects/${selectedProjectId}/credentials`, { credentials: 'include' });
+        const listRes = await fetch(`${API_BASE}/api/projects/${selectedProjectId}/credentials`, { 
+          headers: getAuthHeaders(false),
+          credentials: 'include' 
+        });
         if (listRes.ok) {
           const listData = await listRes.json();
           setCredentials(listData.credentials || []);
@@ -364,7 +453,7 @@ export default function App() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...(session?.csrf_token ? { 'X-CSRF-Token': session.csrf_token } : {})
+          ...getAuthHeaders(true)
         },
         body: JSON.stringify({
           name: upstreamName.trim(),
@@ -401,7 +490,7 @@ export default function App() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...(session?.csrf_token ? { 'X-CSRF-Token': session.csrf_token } : {})
+          ...getAuthHeaders(true)
         },
         credentials: 'include'
       });
@@ -425,7 +514,7 @@ export default function App() {
     try {
       const res = await fetch(`${API_BASE}/api/projects/${selectedProjectId}/upstream`, {
         method: 'DELETE',
-        headers: session?.csrf_token ? { 'X-CSRF-Token': session.csrf_token } : {},
+        headers: getAuthHeaders(true),
         credentials: 'include'
       });
       if (res.ok) {
@@ -445,7 +534,7 @@ export default function App() {
     try {
       const res = await fetch(`${API_BASE}/api/tests/run`, {
         method: 'POST',
-        headers: session?.csrf_token ? { 'X-CSRF-Token': session.csrf_token } : {},
+        headers: getAuthHeaders(true),
         credentials: 'include'
       });
       if (res.ok) {
@@ -542,9 +631,9 @@ export default function App() {
           {/* Developer Session Badge */}
           <div className="flex items-center space-x-2 text-xs bg-indigo-950/40 border border-indigo-800/50 px-3 py-1.5 rounded-lg text-indigo-300">
             <UserCheck className="h-3.5 w-3.5 text-indigo-400" />
-            <span className="font-mono text-[11px]">{session?.developer_identity || 'dev_primary'}</span>
+            <span className="font-mono text-[11px]">{session?.developer_identity || (session === null ? 'connecting...' : 'unauthenticated')}</span>
             <span className="text-[10px] uppercase px-1.5 py-0.2 rounded bg-indigo-900/60 text-indigo-300 font-semibold border border-indigo-700/50">
-              {session?.role || 'developer_admin'}
+              {session?.role || (session === null ? 'CONNECTING' : 'GUEST')}
             </span>
           </div>
 

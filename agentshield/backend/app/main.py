@@ -144,7 +144,7 @@ class SlidingWindowRateLimiter:
                 self.records.clear()
 
 
-login_limiter = SlidingWindowRateLimiter(limit=10, window_seconds=60)
+login_limiter = SlidingWindowRateLimiter(limit=int(os.environ.get("AGENTSHIELD_LOGIN_RATE_LIMIT", 10)), window_seconds=60)
 mcp_limiter = SlidingWindowRateLimiter(limit=int(os.environ.get("AGENTSHIELD_MCP_RATE_LIMIT", 120)), window_seconds=60)
 
 
@@ -167,15 +167,18 @@ def validate_csrf_token(handler: BaseHTTPRequestHandler, auth_info: Dict[str, An
 
 
 def extract_token_from_handler(handler: BaseHTTPRequestHandler) -> str:
-    """Extract Bearer token or X-AgentShield-Key header."""
+    """Extract Bearer token, X-AgentShield-Key, or X-Session-Token header."""
     auth_header = handler.headers.get("Authorization", "").strip()
     api_key_header = handler.headers.get("X-AgentShield-Key", "").strip()
+    session_token_header = handler.headers.get("X-Session-Token", "").strip()
     if auth_header.startswith("Bearer "):
         return auth_header[7:].strip()
     if auth_header:
         return auth_header
     if api_key_header:
         return api_key_header
+    if session_token_header:
+        return session_token_header
     return ""
 
 
@@ -228,6 +231,20 @@ def resolve_auth_info(handler: BaseHTTPRequestHandler) -> Optional[Dict[str, Any
             "owner_identity": "system-administrator",
         }
 
+    # Verify against active developer sessions (supports Authorization: Bearer <session_token> as well as cookies)
+    sess = db.verify_developer_session(token)
+    if sess:
+        return {
+            "is_admin": sess.get("role") == "admin",
+            "role": sess.get("role", "developer_admin"),
+            "developer_identity": sess.get("developer_identity", "external-developer"),
+            "owner_identity": sess.get("developer_identity", "external-developer"),
+            "project_id": "proj_session",
+            "agent_id": "dev-browser-user",
+            "session_token": token,
+            "csrf_token": sess.get("csrf_token"),
+        }
+
     # Verify against hashed database credentials using constant-time check
     cred = db.verify_credential(token)
     if cred:
@@ -273,7 +290,7 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
         else:
             self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-AgentShield-Key, X-CSRF-Token, Accept, Mcp-Session-Id, Mcp-Protocol-Version")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-AgentShield-Key, X-CSRF-Token, X-Session-Token, Accept, Mcp-Session-Id, Mcp-Protocol-Version")
         self.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id, Mcp-Protocol-Version, Retry-After")
 
     def _send_json_response(
@@ -522,6 +539,7 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
                 "developer_identity": dev_id,
                 "role": auth_info.get("role", "developer_admin"),
                 "is_admin": is_admin,
+                "session_token": auth_info.get("session_token"),
                 "csrf_token": auth_info.get("csrf_token"),
                 "projects": projects,
             })
@@ -985,6 +1003,7 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
                     "status": "authenticated",
                     "developer_identity": dev_id,
                     "role": role,
+                    "session_token": sess["session_token"],
                     "csrf_token": sess["csrf_token"],
                     "expires_at": sess["expires_at"],
                 }, cookies=[session_cookie, csrf_cookie])

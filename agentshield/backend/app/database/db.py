@@ -266,9 +266,15 @@ def init_db() -> None:
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO projects (project_id, name, owner_identity, status, created_at, updated_at)
-                    VALUES ('proj_default', 'Default Local Project', 'system-admin', 'active', ?, ?)
+                    VALUES ('proj_default', 'Default Local Project', 'dev_primary', 'active', ?, ?)
                     """,
                     (now_iso, now_iso),
+                )
+                conn.execute(
+                    """
+                    UPDATE projects SET owner_identity = 'dev_primary'
+                    WHERE project_id = 'proj_default' AND owner_identity = 'system-admin';
+                    """
                 )
         finally:
             conn.close()
