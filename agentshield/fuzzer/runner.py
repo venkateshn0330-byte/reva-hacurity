@@ -55,7 +55,7 @@ def run_test_suite() -> Dict[str, Any]:
             agent_id = tc.get("agent_id", "test-agent")
 
             # Route through the exact MCP dispatch gateway
-            dispatch_resp = server.dispatch_tool(tool_name=tool_name, arguments=arguments)
+            dispatch_resp = server.dispatch_tool(tool_name=tool_name, arguments=arguments, event_source="fuzzer_test")
             actual_allowed = not dispatch_resp["isError"]
             
             # Extract policy reason and attribution

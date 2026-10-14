@@ -208,6 +208,19 @@ class TestAgentShieldFullSuite(unittest.TestCase):
         cls.mock_upstream_server.start()
         cls.mock_upstream_url = f"http://127.0.0.1:{mock_port}/mcp"
 
+        # Reset rate limiters to ensure fresh test execution state
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:8000/api/admin/reset-rate-limits",
+                data=b"{}",
+                headers={"Content-Type": "application/json", "Authorization": "Bearer ash_admin_sec_master_2026"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                pass
+        except Exception:
+            pass
+
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, "mock_upstream_server") and cls.mock_upstream_server:
@@ -1566,6 +1579,19 @@ class TestAgentShieldFullSuite(unittest.TestCase):
 
         self.assertTrue(hit_429, "Expected 429 Too Many Requests on login brute force")
 
+        # Clean up rate limiter records for subsequent tests
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:8000/api/admin/reset-rate-limits",
+                data=b"{}",
+                headers={"Content-Type": "application/json", "Authorization": "Bearer ash_admin_sec_master_2026"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                pass
+        except Exception:
+            pass
+
     # 43. Request Body Size Limit Enforcement
     def test_43_request_body_size_limit_enforcement(self):
         # Generate payload exceeding 1MB (1048576 bytes)
@@ -2082,6 +2108,7 @@ class TestAgentShieldFullSuite(unittest.TestCase):
             self.mock_upstream_server.simulate_500 = False
 
     # 57. Audit Trail Accuracy for Upstream Forwarded and Intercepted Tool Calls
+    # 57. Audit Trail Accuracy for Upstream Forwarded and Intercepted Tool Calls
     def test_57_audit_trail_accuracy_for_upstream_calls(self):
         events = db.get_recent_events(limit=50, project_id=self.test_project_id)
         upstream_events = [e for e in events if e.get("is_upstream") == 1]
@@ -2097,6 +2124,143 @@ class TestAgentShieldFullSuite(unittest.TestCase):
             self.assertNotIn("mock-secret-token-123", event_str)
             self.assertNotIn("invalid-bogus-token-xyz", event_str)
 
+    # 58. IBM Bob MCP Request Flow -> SQLite Persistence -> Dashboard API Visibility
+    # 58. IBM Bob MCP Request Flow -> SQLite Persistence -> Dashboard API Visibility
+    def test_58_mcp_real_bob_request_flow_and_dashboard_audit_visibility(self):
+        """
+        Verify the complete request flow:
+        IBM Bob -> /mcp Endpoint -> Policy Engine -> Audit Logger -> SQLite -> Dashboard API (/api/events & /api/stats)
+        """
+        # Create an authorized project credential for IBM Bob in proj_default
+        bob_cred = db.create_credential(project_id="proj_default", agent_id="ibm-bob", expires_in_days=30)
+        bob_key = bob_cred["raw_key"]
+
+        # Create an authenticated developer dashboard session
+        sess = db.create_developer_session(developer_identity="dev@ibm-bob.local", role="developer_admin", duration_hours=24)
+        dash_token = sess["session_token"]
+
+        # 1. MCP Initialization from IBM Bob
+        init_payload = json.dumps({
+            "jsonrpc": "2.0",
+            "id": "bob-init-1",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "clientInfo": {"name": "ibm-bob", "version": "1.0.0"}
+            }
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "http://127.0.0.1:8000/mcp",
+            data=init_payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {bob_key}",
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            self.assertEqual(resp.status, 200)
+            data = json.loads(resp.read().decode("utf-8"))
+            self.assertIn("serverInfo", data["result"])
+
+        # 2. Invoke ALLOWED Tool (doc_sample_001)
+        allowed_payload = json.dumps({
+            "jsonrpc": "2.0",
+            "id": "bob-call-allowed",
+            "method": "tools/call",
+            "params": {
+                "name": "read_document",
+                "arguments": {"document_id": "doc_sample_001"}
+            }
+        }).encode("utf-8")
+        req_allowed = urllib.request.Request(
+            "http://127.0.0.1:8000/mcp",
+            data=allowed_payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {bob_key}",
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req_allowed, timeout=3.0) as resp:
+            self.assertEqual(resp.status, 200)
+            res = json.loads(resp.read().decode("utf-8"))["result"]
+            self.assertFalse(res["isError"], "Allowed tool call must not return isError=True")
+            self.assertIn("doc_sample_001", res["content"][0]["text"])
+
+        # 3. Invoke BLOCKED Tool (confidential payroll document)
+        blocked_payload = json.dumps({
+            "jsonrpc": "2.0",
+            "id": "bob-call-blocked",
+            "method": "tools/call",
+            "params": {
+                "name": "read_document",
+                "arguments": {"document_id": "confidential_payroll_2026.pdf"}
+            }
+        }).encode("utf-8")
+        req_blocked = urllib.request.Request(
+            "http://127.0.0.1:8000/mcp",
+            data=blocked_payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {bob_key}",
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req_blocked, timeout=3.0) as resp:
+            self.assertEqual(resp.status, 200)
+            res = json.loads(resp.read().decode("utf-8"))["result"]
+            self.assertTrue(res["isError"], "Blocked tool call must return isError=True")
+            self.assertIn("BLOCKED", res["content"][0]["text"])
+            self.assertIn("confidential", res["content"][0]["text"].lower())
+
+        # 4. Verify Dashboard API GET /api/events returns these records
+        dash_req = urllib.request.Request(
+            "http://127.0.0.1:8000/api/events?limit=20",
+            headers={"Authorization": f"Bearer {dash_token}"}
+        )
+        with urllib.request.urlopen(dash_req, timeout=3.0) as resp:
+            self.assertEqual(resp.status, 200)
+            dash_data = json.loads(resp.read().decode("utf-8"))
+            dash_events = dash_data.get("events", [])
+            self.assertGreater(len(dash_events), 0)
+
+            # Find the allowed event and blocked event
+            bob_events = [e for e in dash_events if e.get("agent_id") == "ibm-bob"]
+            self.assertGreaterEqual(len(bob_events), 2, "Expected at least 2 IBM Bob events in dashboard feed")
+
+            allowed_events = [e for e in bob_events if e.get("allowed") is True]
+            blocked_events = [e for e in bob_events if e.get("allowed") is False]
+
+            self.assertGreater(len(allowed_events), 0, "Dashboard must show IBM Bob allowed event")
+            self.assertGreater(len(blocked_events), 0, "Dashboard must show IBM Bob blocked event")
+
+            ev_allowed = allowed_events[0]
+            self.assertEqual(ev_allowed["tool_name"], "read_document")
+            self.assertEqual(ev_allowed["downstream_status"], "EXECUTED")
+            self.assertIn(ev_allowed.get("policy_code"), ("P-RBAC", "P-AUTHZ", "P-T"))
+            self.assertEqual(ev_allowed.get("event_source"), "mcp_live")
+
+            ev_blocked = blocked_events[0]
+            self.assertEqual(ev_blocked["tool_name"], "read_document")
+            self.assertEqual(ev_blocked["downstream_status"], "BLOCKED")
+            self.assertIn(ev_blocked.get("policy_code"), ("P-F", "P-AUTHZ", "P-FAILCLOSED"))
+            self.assertEqual(ev_blocked.get("event_source"), "mcp_live")
+
+        # 5. Verify Dashboard API GET /api/stats includes updated metrics
+        stats_req = urllib.request.Request(
+            "http://127.0.0.1:8000/api/stats",
+            headers={"Authorization": f"Bearer {dash_token}"}
+        )
+        with urllib.request.urlopen(stats_req, timeout=3.0) as resp:
+            self.assertEqual(resp.status, 200)
+            stats = json.loads(resp.read().decode("utf-8"))
+            self.assertGreater(stats["total_intercepted"], 0)
+            self.assertGreater(stats["allowed_count"], 0)
+            self.assertGreater(stats["blocked_count"], 0)
+            self.assertGreater(stats.get("real_mcp_count", 0), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -29,6 +29,7 @@ def log_decision(
     request_id: Optional[str] = None,
     project_id: str = "proj_default",
     is_upstream: int = 0,
+    event_source: str = "mcp_live",
 ) -> Dict[str, Any]:
     """
     Log an authorization decision to SQLite with full 25-Policy attribution and project scoping.
@@ -63,6 +64,7 @@ def log_decision(
         timestamp=decision.get("timestamp"),
         project_id=project_id,
         is_upstream=1 if is_upstream else 0,
+        event_source=event_source,
     )
 
 

@@ -33,8 +33,12 @@ import {
   Check,
   Code,
   Sparkles,
-  Globe
+  Globe,
+  ArrowRight,
+  LogOut
 } from 'lucide-react';
+import LandingPage from './components/LandingPage';
+import LoginPage from './components/LoginPage';
 
 const getApiBase = () => {
   if (typeof window === 'undefined') return 'http://127.0.0.1:8000';
@@ -52,6 +56,7 @@ export default function App() {
   // Global Dashboard & Security State
   const [stats, setStats] = useState(null);
   const [events, setEvents] = useState([]);
+  const [projects, setProjects] = useState([]);
   const [policies, setPolicies] = useState([]);
   const [testSuite, setTestSuite] = useState(null);
   const [backendOnline, setBackendOnline] = useState(false);
@@ -60,14 +65,16 @@ export default function App() {
   const [selectedEvent, setSelectedEvent] = useState(null);
   const [selectedPolicy, setSelectedPolicy] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard' | 'projects' | 'connect' | 'policies' | 'activity' | 'fuzzer' | 'arch'
+  const [viewMode, setViewMode] = useState('landing'); // 'landing' | 'login' | 'dashboard'
   const [filterType, setFilterType] = useState('ALL'); // 'ALL' | 'ALLOWED' | 'BLOCKED'
   const [policySearch, setPolicySearch] = useState('');
   const [policyCategoryFilter, setPolicyCategoryFilter] = useState('ALL');
 
   // Tenant & Developer Session State
   const [session, setSession] = useState(null);
-  const [projects, setProjects] = useState([]);
-  const [selectedProjectId, setSelectedProjectId] = useState('proj_default');
+  const [selectedProjectId, setSelectedProjectId] = useState(() => {
+    return localStorage.getItem('agentshield_selected_project') || 'proj_default';
+  });
   const [connectInfo, setConnectInfo] = useState(null);
   const [credentials, setCredentials] = useState([]);
   const [copiedKey, setCopiedKey] = useState(false);
@@ -110,55 +117,36 @@ export default function App() {
     return headers;
   };
 
-  // Ensure Developer Session & Fetch Core Data
-  const ensureSessionAndFetchData = async (targetProjectId = null) => {
-    setRefreshing(true);
+  // Ensure Developer Session & Fetch Core Data (supports silent background polling)
+  const ensureSessionAndFetchData = async (targetProjectId = null, activeSessionOverride = null, isSilent = false) => {
+    if (!isSilent) setRefreshing(true);
     try {
       // 1. Health check
       const healthRes = await fetch(`${API_BASE}/health`, { credentials: 'include' }).catch(() => null);
       const isOnline = Boolean(healthRes && healthRes.ok);
       setBackendOnline(isOnline);
       if (!isOnline) {
-        setRefreshing(false);
+        if (!isSilent) setRefreshing(false);
         return;
       }
 
-      // 2. Developer Session verification / automatic bootstrap
+      // 2. Developer Session verification
+      let sessionData = activeSessionOverride;
       const storedToken = localStorage.getItem('agentshield_session_token');
       const initialHeaders = storedToken ? { 'Authorization': `Bearer ${storedToken}`, 'X-Session-Token': storedToken } : {};
 
-      let sessionRes = await fetch(`${API_BASE}/api/auth/session`, { 
-        headers: initialHeaders,
-        credentials: 'include' 
-      }).catch(() => null);
-      let sessionData = sessionRes && sessionRes.ok ? await sessionRes.json() : null;
+      if (!sessionData) {
+        let sessionRes = await fetch(`${API_BASE}/api/auth/session`, { 
+          headers: initialHeaders,
+          credentials: 'include' 
+        }).catch(() => null);
+        sessionData = sessionRes && sessionRes.ok ? await sessionRes.json() : null;
+      }
 
       if (!sessionData || !sessionData.authenticated) {
-        // Automatically establish developer session for the dashboard
-        const loginRes = await fetch(`${API_BASE}/api/auth/login`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ developer_identity: 'dev_primary' }),
-          credentials: 'include'
-        }).catch(() => null);
-
-        if (loginRes && loginRes.ok) {
-          const loginData = await loginRes.json();
-          if (loginData?.session_token) {
-            localStorage.setItem('agentshield_session_token', loginData.session_token);
-          }
-          if (loginData?.csrf_token) {
-            localStorage.setItem('agentshield_csrf_token', loginData.csrf_token);
-          }
-          sessionRes = await fetch(`${API_BASE}/api/auth/session`, { 
-            headers: loginData?.session_token ? { 
-              'Authorization': `Bearer ${loginData.session_token}`,
-              'X-Session-Token': loginData.session_token
-            } : {},
-            credentials: 'include' 
-          }).catch(() => null);
-          sessionData = sessionRes && sessionRes.ok ? await sessionRes.json() : null;
-        }
+        setSession(null);
+        setRefreshing(false);
+        return;
       }
 
       if (sessionData && sessionData.authenticated) {
@@ -172,7 +160,7 @@ export default function App() {
         : initialHeaders;
 
       // 3. Projects List
-      let currentProjId = targetProjectId || selectedProjectId;
+      let currentProjId = targetProjectId !== null ? targetProjectId : selectedProjectId;
       const projectsRes = await fetch(`${API_BASE}/api/projects`, { 
         headers: activeAuthHeaders,
         credentials: 'include' 
@@ -181,14 +169,15 @@ export default function App() {
         const pList = await projectsRes.json();
         const projs = pList.projects || [];
         setProjects(projs);
-        if (projs.length > 0 && (!currentProjId || !projs.find(p => p.project_id === currentProjId))) {
-          currentProjId = projs[0].project_id;
+        if (projs.length > 0 && currentProjId !== 'all' && (!currentProjId || !projs.find(p => p.project_id === currentProjId))) {
+          const defProj = projs.find(p => p.project_id === 'proj_default');
+          currentProjId = defProj ? 'proj_default' : projs[0].project_id;
           setSelectedProjectId(currentProjId);
         }
       }
 
-      // 4. Scoped Stats for Selected Project
-      const statsUrl = currentProjId ? `${API_BASE}/api/stats?project_id=${currentProjId}` : `${API_BASE}/api/stats`;
+      // 4. Scoped Stats for Selected Project or All
+      const statsUrl = currentProjId && currentProjId !== 'all' ? `${API_BASE}/api/stats?project_id=${currentProjId}` : `${API_BASE}/api/stats`;
       const statsRes = await fetch(statsUrl, { 
         headers: activeAuthHeaders,
         credentials: 'include' 
@@ -219,8 +208,8 @@ export default function App() {
         }
       }
 
-      // 6. Scoped Events for Selected Project
-      const eventsUrl = currentProjId ? `${API_BASE}/api/projects/${currentProjId}/events?limit=50` : `${API_BASE}/api/events?limit=50`;
+      // 6. Scoped Events for Selected Project or All
+      const eventsUrl = currentProjId && currentProjId !== 'all' ? `${API_BASE}/api/projects/${currentProjId}/events?limit=50` : `${API_BASE}/api/events?limit=50`;
       const eventsRes = await fetch(eventsUrl, { 
         headers: activeAuthHeaders,
         credentials: 'include' 
@@ -278,20 +267,71 @@ export default function App() {
     } catch (err) {
       console.error('Error fetching AgentShield data:', err);
     } finally {
-      setRefreshing(false);
+      if (!isSilent) setRefreshing(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await fetch(`${API_BASE}/api/auth/logout`, {
+        method: 'POST',
+        headers: getAuthHeaders(true),
+        credentials: 'include'
+      }).catch(() => null);
+    } finally {
+      localStorage.removeItem('agentshield_session_token');
+      localStorage.removeItem('agentshield_csrf_token');
+      setSession(null);
+      setViewMode('landing');
     }
   };
 
   useEffect(() => {
-    ensureSessionAndFetchData();
+    const checkAuthOnMount = async () => {
+      const storedToken = localStorage.getItem('agentshield_session_token');
+      let activeSession = null;
+      if (storedToken) {
+        const headers = { 'Authorization': `Bearer ${storedToken}`, 'X-Session-Token': storedToken };
+        const res = await fetch(`${API_BASE}/api/auth/session`, { headers, credentials: 'include' }).catch(() => null);
+        if (res && res.ok) {
+          const sData = await res.json();
+          if (sData?.authenticated) {
+            activeSession = sData;
+            setSession(sData);
+          }
+        }
+      }
+
+      // Check URL query parameters or hash to determine initial view
+      const params = new URLSearchParams(window.location.search);
+      const urlView = params.get('view') || (window.location.hash ? window.location.hash.replace('#', '') : null);
+
+      if (urlView === 'dashboard') {
+        setViewMode('dashboard');
+        if (activeSession) {
+          await ensureSessionAndFetchData(selectedProjectId, activeSession);
+        }
+      } else if (urlView === 'login') {
+        setViewMode('login');
+      } else {
+        // Default entry view is the public Landing Page
+        setViewMode('landing');
+      }
+    };
+    checkAuthOnMount();
+  }, []);
+
+  useEffect(() => {
+    if (viewMode !== 'dashboard' || !session?.authenticated) return;
     const interval = setInterval(() => {
-      ensureSessionAndFetchData(selectedProjectId);
-    }, 4000);
+      ensureSessionAndFetchData(selectedProjectId, null, true);
+    }, 2000);
     return () => clearInterval(interval);
-  }, [selectedProjectId]);
+  }, [selectedProjectId, viewMode, session]);
 
   const handleSelectProject = (projId) => {
     setSelectedProjectId(projId);
+    localStorage.setItem('agentshield_selected_project', projId);
     ensureSessionAndFetchData(projId);
   };
 
@@ -564,6 +604,9 @@ export default function App() {
   };
 
   const filteredEvents = events.filter((e) => {
+    const isRealMcp = e.event_source === 'mcp_live' || (e.agent_id !== 'demo-agent' && e.agent_id !== 'suite-agent');
+    if (filterType === 'REAL_MCP') return isRealMcp;
+    if (filterType === 'FUZZER') return !isRealMcp;
     if (filterType === 'ALLOWED') return e.allowed;
     if (filterType === 'BLOCKED') return !e.allowed;
     return true;
@@ -588,19 +631,53 @@ export default function App() {
 
   const categories = ['ALL', 'Integrity', 'Confidentiality', 'Access Control', 'System Governance', 'Defense in Depth'];
 
+  if (viewMode === 'landing') {
+    return (
+      <LandingPage
+        onGetStarted={() => setViewMode(session?.authenticated ? 'dashboard' : 'login')}
+        onGoToDashboard={() => setViewMode('dashboard')}
+        isAuthenticated={Boolean(session?.authenticated)}
+        onLogout={handleLogout}
+      />
+    );
+  }
+
+  if (viewMode === 'login') {
+    return (
+      <LoginPage
+        onLoginSuccess={(loginData) => {
+          setSession(loginData);
+          setViewMode('dashboard');
+          ensureSessionAndFetchData(selectedProjectId, loginData);
+        }}
+        onBackToHome={() => setViewMode('landing')}
+        apiBase={API_BASE}
+      />
+    );
+  }
+
   return (
     <div className="min-h-screen bg-[#070b14] text-slate-100 font-sans flex flex-col">
       {/* Top Header */}
       <header className="border-b border-slate-800/80 bg-[#0c1220]/90 backdrop-blur sticky top-0 z-40 px-6 py-3.5 flex items-center justify-between shadow-lg shadow-black/20">
-        <div className="flex items-center space-x-4">
-          <div className="h-10 w-10 rounded-lg bg-gradient-to-br from-indigo-500 to-cyan-500 p-0.5 shadow-cyan-500/20 shadow-md">
+        <div 
+          onClick={() => {
+            if (window.location.hash === '#dashboard') {
+              window.history.pushState(null, '', window.location.pathname);
+            }
+            setViewMode('landing');
+          }}
+          className="flex items-center space-x-4 cursor-pointer hover:opacity-90 transition group"
+          title="Return to Public Landing Page"
+        >
+          <div className="h-10 w-10 rounded-lg bg-gradient-to-br from-indigo-500 to-cyan-500 p-0.5 shadow-cyan-500/20 shadow-md group-hover:shadow-cyan-500/40 transition">
             <div className="h-full w-full bg-[#090d16] rounded-[7px] flex items-center justify-center">
               <Shield className="h-5 w-5 text-cyan-400" />
             </div>
           </div>
           <div>
             <div className="flex items-center space-x-2">
-              <h1 className="font-bold text-lg tracking-tight text-white">AgentShield</h1>
+              <h1 className="font-bold text-lg tracking-tight text-white group-hover:text-cyan-300 transition">AgentShield</h1>
               <span className="text-[10px] uppercase font-semibold px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
                 Remote MCP Security Gateway
               </span>
@@ -620,6 +697,9 @@ export default function App() {
               onChange={(e) => handleSelectProject(e.target.value)}
               className="bg-transparent text-xs font-semibold text-white focus:outline-none cursor-pointer"
             >
+              <option value="all" className="bg-slate-900 text-cyan-300 font-semibold">
+                🌐 All Projects (Global MCP Feed)
+              </option>
               {projects.map((p) => (
                 <option key={p.project_id} value={p.project_id} className="bg-slate-900 text-white">
                   {p.name} ({p.project_id})
@@ -656,6 +736,29 @@ export default function App() {
             title="Refresh All Data"
           >
             <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin text-cyan-400' : ''}`} />
+          </button>
+
+          <button
+            onClick={() => {
+              if (window.location.hash === '#dashboard') {
+                window.history.pushState(null, '', window.location.pathname);
+              }
+              setViewMode('landing');
+            }}
+            className="px-3.5 py-1.5 rounded-lg border border-cyan-500/40 bg-cyan-950/40 hover:bg-cyan-900/50 text-cyan-300 text-xs font-medium transition flex items-center space-x-1.5 cursor-pointer shadow-sm shadow-cyan-500/10"
+            title="View Public Landing Page"
+          >
+            <Globe className="h-3.5 w-3.5 text-cyan-400" />
+            <span>Landing Page</span>
+          </button>
+
+          <button
+            onClick={handleLogout}
+            className="px-3 py-1.5 rounded-lg border border-rose-900/50 bg-rose-950/20 hover:bg-rose-900/40 text-rose-300 text-xs font-medium transition flex items-center space-x-1.5 cursor-pointer"
+            title="Sign out of developer session"
+          >
+            <LogOut className="h-3.5 w-3.5 text-rose-400" />
+            <span>Sign Out</span>
           </button>
         </div>
       </header>
@@ -787,12 +890,19 @@ export default function App() {
               </div>
               <div className="text-slate-400 flex items-center justify-between">
                 <span>Developer:</span>
-                <span className="text-slate-200 font-mono text-[11px]">{session?.developer_identity || 'dev_primary'}</span>
+                <span className="text-slate-200 font-mono text-[11px]">{session?.email || session?.developer_identity || 'dev_primary'}</span>
               </div>
               <div className="text-slate-400 flex items-center justify-between">
                 <span>Total Interceptions:</span>
-                <span className="text-white font-mono font-bold">{stats?.total_intercepted || 0}</span>
+                <span className="text-white font-mono font-bold">{stats?.total_intercepted ?? stats?.total_requests ?? 0}</span>
               </div>
+              <button
+                onClick={handleLogout}
+                className="w-full mt-2 py-1.5 px-2 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-[11px] text-slate-400 hover:text-rose-400 flex items-center justify-center space-x-1.5 transition cursor-pointer"
+              >
+                <LogOut className="h-3 w-3" />
+                <span>Sign Out</span>
+              </button>
             </div>
           </div>
         </nav>
@@ -838,7 +948,7 @@ export default function App() {
                     <Activity className="h-4 w-4 text-cyan-400" />
                   </div>
                   <div className="text-2xl font-bold font-mono text-white mt-2">
-                    {stats?.total_intercepted ?? 0}
+                    {stats?.total_intercepted ?? stats?.total_requests ?? 0}
                   </div>
                   <div className="text-[11px] text-slate-400 mt-1">Remote MCP & STDIO tool calls</div>
                 </div>
@@ -849,7 +959,7 @@ export default function App() {
                     <ShieldCheck className="h-4 w-4 text-emerald-400" />
                   </div>
                   <div className="text-2xl font-bold font-mono text-emerald-400 mt-2">
-                    {stats?.allowed_count ?? 0}
+                    {stats?.allowed_count ?? stats?.allowed_requests ?? 0}
                   </div>
                   <div className="text-[11px] text-slate-400 mt-1">Verified within permitted flows</div>
                 </div>
@@ -860,7 +970,7 @@ export default function App() {
                     <ShieldAlert className="h-4 w-4 text-rose-400" />
                   </div>
                   <div className="text-2xl font-bold font-mono text-rose-400 mt-2">
-                    {stats?.blocked_count ?? 0}
+                    {stats?.blocked_count ?? stats?.blocked_requests ?? 0}
                   </div>
                   <div className="text-[11px] text-slate-400 mt-1">Violations actively contained</div>
                 </div>
@@ -871,7 +981,7 @@ export default function App() {
                     <Lock className="h-4 w-4 text-indigo-400" />
                   </div>
                   <div className="text-2xl font-bold font-mono text-indigo-300 mt-2">
-                    {stats?.block_rate ?? '0%'}
+                    {stats?.block_rate ?? (stats?.total_requests ? `${Math.round(((stats.blocked_requests || stats.blocked_count || 0) / stats.total_requests) * 100)}%` : '0%')}
                   </div>
                   <div className="text-[11px] text-slate-400 mt-1">Defense enforcement ratio</div>
                 </div>
@@ -924,6 +1034,15 @@ export default function App() {
                               }`}
                             >
                               {ev.allowed ? 'PERMIT' : 'BLOCKED'}
+                            </span>
+                            <span
+                              className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-bold uppercase ${
+                                ev.event_source === 'mcp_live' || (ev.agent_id !== 'demo-agent' && ev.agent_id !== 'suite-agent')
+                                  ? 'bg-cyan-950/80 text-cyan-300 border border-cyan-800/60'
+                                  : 'bg-purple-950/80 text-purple-300 border border-purple-800/60'
+                              }`}
+                            >
+                              {ev.event_source === 'mcp_live' || (ev.agent_id !== 'demo-agent' && ev.agent_id !== 'suite-agent') ? 'REAL MCP' : 'TEST'}
                             </span>
                             <div>
                               <span className="font-semibold text-white font-mono">{ev.tool_name}</span>
@@ -1587,7 +1706,7 @@ const result = await client.callTool({
                   </p>
                 </div>
 
-                <div className="flex items-center space-x-2">
+                <div className="flex flex-wrap items-center gap-2">
                   <button
                     onClick={() => setFilterType('ALL')}
                     className={`px-3 py-1.5 rounded-lg text-xs font-medium transition ${
@@ -1597,6 +1716,26 @@ const result = await client.callTool({
                     }`}
                   >
                     All Events ({events.length})
+                  </button>
+                  <button
+                    onClick={() => setFilterType('REAL_MCP')}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition ${
+                      filterType === 'REAL_MCP'
+                        ? 'bg-cyan-950 text-cyan-300 border border-cyan-800'
+                        : 'bg-slate-900 text-slate-400 hover:text-slate-200 border border-slate-800'
+                    }`}
+                  >
+                    Real MCP Traffic ({events.filter(e => e.event_source === 'mcp_live' || (e.agent_id !== 'demo-agent' && e.agent_id !== 'suite-agent')).length})
+                  </button>
+                  <button
+                    onClick={() => setFilterType('FUZZER')}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition ${
+                      filterType === 'FUZZER'
+                        ? 'bg-purple-950 text-purple-300 border border-purple-800'
+                        : 'bg-slate-900 text-slate-400 hover:text-slate-200 border border-slate-800'
+                    }`}
+                  >
+                    Fuzzer Tests ({events.filter(e => e.event_source === 'fuzzer_test' || e.agent_id === 'demo-agent' || e.agent_id === 'suite-agent').length})
                   </button>
                   <button
                     onClick={() => setFilterType('ALLOWED')}
@@ -1626,6 +1765,7 @@ const result = await client.callTool({
                   <thead className="bg-slate-900/80 text-slate-400 uppercase text-[10px] font-semibold border-b border-slate-800">
                     <tr>
                       <th className="px-4 py-3">Timestamp</th>
+                      <th className="px-4 py-3">Source</th>
                       <th className="px-4 py-3">Decision</th>
                       <th className="px-4 py-3">Tool Name</th>
                       <th className="px-4 py-3">Target Resource / Destination</th>
@@ -1637,48 +1777,62 @@ const result = await client.callTool({
                   <tbody className="divide-y divide-slate-800/60 font-sans">
                     {filteredEvents.length === 0 ? (
                       <tr>
-                        <td colSpan={7} className="px-4 py-8 text-center text-slate-500">
+                        <td colSpan={8} className="px-4 py-8 text-center text-slate-500">
                           No audit events matching this filter.
                         </td>
                       </tr>
                     ) : (
-                      filteredEvents.map((ev) => (
-                        <tr
-                          key={ev.id || ev.request_id}
-                          onClick={() => setSelectedEvent(ev)}
-                          className="hover:bg-slate-800/40 cursor-pointer transition"
-                        >
-                          <td className="px-4 py-3 text-slate-400 font-mono text-[11px]">
-                            {new Date(ev.timestamp).toLocaleTimeString()}
-                          </td>
-                          <td className="px-4 py-3">
-                            <span
-                              className={`px-2 py-0.5 rounded text-[10px] font-bold font-mono ${
-                                ev.allowed
-                                  ? 'bg-emerald-950 text-emerald-400 border border-emerald-800'
-                                  : 'bg-rose-950 text-rose-400 border border-rose-800'
-                              }`}
-                            >
-                              {ev.allowed ? 'ALLOWED' : 'BLOCKED'}
-                            </span>
-                          </td>
-                          <td className="px-4 py-3 font-semibold text-white font-mono">{ev.tool_name}</td>
-                          <td className="px-4 py-3 text-slate-300 font-mono truncate max-w-[200px]">
-                            {ev.resource_or_destination || 'None'}
-                          </td>
-                          <td className="px-4 py-3 text-indigo-300 font-mono">{ev.policy_code || 'P-AUTHZ'}</td>
-                          <td className="px-4 py-3 text-slate-400 font-mono text-[11px]">{ev.agent_id}</td>
-                          <td className="px-4 py-3 text-right">
-                            <span
-                              className={`text-[11px] font-mono font-medium ${
-                                ev.downstream_status === 'EXECUTED' ? 'text-emerald-400' : 'text-rose-400'
-                              }`}
-                            >
-                              {ev.downstream_status}
-                            </span>
-                          </td>
-                        </tr>
-                      ))
+                      filteredEvents.map((ev) => {
+                        const isReal = ev.event_source === 'mcp_live' || (ev.agent_id !== 'demo-agent' && ev.agent_id !== 'suite-agent');
+                        return (
+                          <tr
+                            key={ev.id || ev.request_id}
+                            onClick={() => setSelectedEvent(ev)}
+                            className="hover:bg-slate-800/40 cursor-pointer transition"
+                          >
+                            <td className="px-4 py-3 text-slate-400 font-mono text-[11px]">
+                              {new Date(ev.timestamp).toLocaleTimeString()}
+                            </td>
+                            <td className="px-4 py-3">
+                              <span
+                                className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-bold uppercase ${
+                                  isReal
+                                    ? 'bg-cyan-950/80 text-cyan-300 border border-cyan-800/60'
+                                    : 'bg-purple-950/80 text-purple-300 border border-purple-800/60'
+                                }`}
+                              >
+                                {isReal ? 'REAL MCP' : 'TEST'}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3">
+                              <span
+                                className={`px-2 py-0.5 rounded text-[10px] font-bold font-mono ${
+                                  ev.allowed
+                                    ? 'bg-emerald-950 text-emerald-400 border border-emerald-800'
+                                    : 'bg-rose-950 text-rose-400 border border-rose-800'
+                                }`}
+                              >
+                                {ev.allowed ? 'ALLOWED' : 'BLOCKED'}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3 font-semibold text-white font-mono">{ev.tool_name}</td>
+                            <td className="px-4 py-3 text-slate-300 font-mono truncate max-w-[200px]">
+                              {ev.resource_or_destination || 'None'}
+                            </td>
+                            <td className="px-4 py-3 text-indigo-300 font-mono">{ev.policy_code || 'P-AUTHZ'}</td>
+                            <td className="px-4 py-3 text-slate-400 font-mono text-[11px]">{ev.agent_id}</td>
+                            <td className="px-4 py-3 text-right">
+                              <span
+                                className={`text-[11px] font-mono font-medium ${
+                                  ev.downstream_status === 'EXECUTED' ? 'text-emerald-400' : 'text-rose-400'
+                                }`}
+                              >
+                                {ev.downstream_status}
+                              </span>
+                            </td>
+                          </tr>
+                        );
+                      })
                     )}
                   </tbody>
                 </table>

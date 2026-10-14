@@ -169,6 +169,7 @@ def _safe_log_event(
     downstream_status: str,
     project_id: str = "proj_default",
     is_upstream: int = 0,
+    event_source: str = "mcp_live",
 ):
     """Safely log event to SQLite without throwing exceptions to caller."""
     try:
@@ -181,6 +182,7 @@ def _safe_log_event(
             downstream_status=downstream_status,
             project_id=project_id,
             is_upstream=is_upstream,
+            event_source=event_source,
         )
     except Exception as err:
         logger.warning(f"Could not write audit log to SQLite: {err}")
@@ -191,6 +193,7 @@ def dispatch_tool(
     arguments: Dict[str, Any],
     authenticated_agent_id: Optional[str] = None,
     project_id: str = "proj_default",
+    event_source: str = "mcp_live",
 ) -> Dict[str, Any]:
     """
     Core security gateway dispatcher.
@@ -203,9 +206,10 @@ def dispatch_tool(
         # Force the authenticated identity into arguments so downstream cannot be spoofed
         arguments = {**arguments, "agent_id": authenticated_agent_id}
     else:
-        agent_id = arguments.get("agent_id", "demo-agent")
+        # Check if client passed an agent identifier or default based on caller source
+        agent_id = arguments.get("agent_id") or ("ibm-bob" if event_source == "mcp_live" else "demo-agent")
 
-    logger.info(f"INCOMING REQUEST: tool='{tool_name}', agent='{agent_id}', project='{project_id}', args={json.dumps(arguments)}")
+    logger.info(f"INCOMING REQUEST: tool='{tool_name}', agent='{agent_id}', project='{project_id}', source='{event_source}', args={json.dumps(arguments)}")
 
     # Check if project has an active upstream MCP configuration
     upstream_conf = None
@@ -223,13 +227,25 @@ def dispatch_tool(
         logger.warning(f"Error checking upstream server for project {project_id}: {exc}")
 
     # 1. SHARED SECURITY AUTHORIZATION GATEWAY
-    decision = authorize(
-        tool_name=tool_name,
-        arguments=arguments,
-        agent_id=agent_id,
-        project_id=project_id,
-        is_upstream=is_upstream_tool,
-    )
+    try:
+        decision = authorize(
+            tool_name=tool_name,
+            arguments=arguments,
+            agent_id=agent_id,
+            project_id=project_id,
+            is_upstream=is_upstream_tool,
+        )
+    except Exception as exc:
+        logger.error(f"Policy evaluation error in gateway (fail-closed): {exc}", exc_info=True)
+        decision = {
+            "allowed": False,
+            "reason": f"Security policy evaluation failure (fail-closed): {str(exc)}",
+            "risk_level": "CRITICAL",
+            "policy_id": 17,
+            "policy_code": "P-FAILCLOSED",
+            "policy_name": "Policy 17: Fail-Closed Policy",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
     
     if not decision.get("allowed", False):
         reason = decision.get("reason", "Operation blocked by AgentShield security policy.")
@@ -238,7 +254,7 @@ def dispatch_tool(
             f"SECURITY GATEWAY BLOCKED: tool='{tool_name}' agent='{agent_id}' project='{project_id}' risk={risk} reason='{reason}'"
         )
         
-        # Log blocked event to SQLite
+        # Log blocked event to SQLite before returning error response to client
         _safe_log_event(
             agent_id=agent_id,
             tool_name=tool_name,
@@ -247,6 +263,7 @@ def dispatch_tool(
             downstream_status="BLOCKED",
             project_id=project_id,
             is_upstream=1 if is_upstream_tool else 0,
+            event_source=event_source,
         )
 
         return {
@@ -291,6 +308,7 @@ def dispatch_tool(
                 downstream_status=downstream_status,
                 project_id=project_id,
                 is_upstream=1,
+                event_source=event_source,
             )
             return {
                 "content": upstream_resp["content"],
@@ -307,6 +325,7 @@ def dispatch_tool(
                 downstream_status="FAILED",
                 project_id=project_id,
                 is_upstream=1,
+                event_source=event_source,
             )
             return {
                 "content": [{"type": "text", "text": f"Upstream execution error: {str(e)}"}],
@@ -332,6 +351,16 @@ def dispatch_tool(
                 document_id=doc_id, destination=destination, agent_id=agent_id
             )
         else:
+            _safe_log_event(
+                agent_id=agent_id,
+                tool_name=tool_name,
+                arguments=arguments,
+                decision=decision,
+                downstream_status="FAILED",
+                project_id=project_id,
+                is_upstream=0,
+                event_source=event_source,
+            )
             return {
                 "content": [{"type": "text", "text": f"Error: Tool '{tool_name}' not implemented."}],
                 "isError": True,
@@ -346,6 +375,7 @@ def dispatch_tool(
             downstream_status="EXECUTED",
             project_id=project_id,
             is_upstream=0,
+            event_source=event_source,
         )
 
         return {
@@ -367,6 +397,7 @@ def dispatch_tool(
             decision=decision,
             downstream_status="FAILED",
             project_id=project_id,
+            event_source=event_source,
         )
         return {
             "content": [{"type": "text", "text": f"Tool execution failed: {str(e)}"}],
@@ -523,6 +554,7 @@ def handle_jsonrpc_message(
             arguments=arguments,
             authenticated_agent_id=authenticated_agent_id,
             project_id=project_id,
+            event_source="mcp_live",
         )
 
         wire_result = {

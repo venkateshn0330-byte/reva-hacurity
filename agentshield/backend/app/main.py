@@ -210,7 +210,7 @@ def resolve_auth_info(handler: BaseHTTPRequestHandler) -> Optional[Dict[str, Any
                         "role": sess.get("role", "developer_admin"),
                         "developer_identity": sess.get("developer_identity", "external-developer"),
                         "owner_identity": sess.get("developer_identity", "external-developer"),
-                        "project_id": "proj_session",
+                        "project_id": "proj_default",
                         "agent_id": "dev-browser-user",
                         "session_token": sess_token,
                         "csrf_token": sess.get("csrf_token"),
@@ -239,7 +239,7 @@ def resolve_auth_info(handler: BaseHTTPRequestHandler) -> Optional[Dict[str, Any
             "role": sess.get("role", "developer_admin"),
             "developer_identity": sess.get("developer_identity", "external-developer"),
             "owner_identity": sess.get("developer_identity", "external-developer"),
-            "project_id": "proj_session",
+            "project_id": "proj_default",
             "agent_id": "dev-browser-user",
             "session_token": token,
             "csrf_token": sess.get("csrf_token"),
@@ -258,7 +258,7 @@ def resolve_auth_info(handler: BaseHTTPRequestHandler) -> Optional[Dict[str, Any
             "owner_identity": cred.get("owner_identity", "project-owner"),
         }
 
-    # Development fallback: loopback-only and only when explicitly enabled
+    # Development fallback: loopback-only and active in development mode
     client_ip = handler.client_address[0] if handler.client_address else "127.0.0.1"
     is_loopback = client_ip in ("127.0.0.1", "::1", "localhost", "testclient")
     if is_dev_mode_enabled() and is_loopback:
@@ -267,13 +267,44 @@ def resolve_auth_info(handler: BaseHTTPRequestHandler) -> Optional[Dict[str, Any
                 "is_admin": False,
                 "role": "developer_admin",
                 "project_id": "proj_default",
-                "agent_id": "dev-agent",
-                "key_id": "dev-loopback-key",
+                "agent_id": "ibm-bob",
+                "key_id": "bob-loopback-key",
                 "developer_identity": "local-developer",
                 "owner_identity": "local-developer",
             }
 
     return None
+
+
+def is_project_authorized(auth_info: Optional[Dict[str, Any]], project: Optional[Dict[str, Any]], target_project_id: str) -> bool:
+    """
+    Check if the caller is authorized to access or manage the project.
+    - System administrators have universal access.
+    - 'proj_default' is the default local development project, accessible to authenticated developer administrators.
+    - Tenant project owners and tokens bound directly to the project are authorized.
+    - Cross-tenant access between distinct private projects is strictly blocked (403).
+    """
+    if not auth_info:
+        return False
+    if auth_info.get("is_admin"):
+        return True
+
+    dev_id = auth_info.get("developer_identity") or auth_info.get("owner_identity")
+    proj_owner = project.get("owner_identity") if project else None
+
+    # Direct project owner matches caller identity
+    if proj_owner and dev_id and proj_owner == dev_id:
+        return True
+
+    # Token directly bound to target project
+    if auth_info.get("project_id") == target_project_id:
+        return True
+
+    # Shared default local project is accessible to authenticated developer admins
+    if target_project_id == "proj_default" and auth_info.get("role") in ("developer_admin", "admin"):
+        return True
+
+    return False
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -354,11 +385,9 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
                 self._send_json_response(404, {"error": f"Project '{target_proj_id}' not found."})
                 return
 
-            if not auth_info.get("is_admin"):
-                dev_id = auth_info.get("developer_identity") or auth_info.get("owner_identity")
-                if proj.get("owner_identity") != dev_id and auth_info.get("project_id") != target_proj_id:
-                    self._send_json_response(403, {"error": "Forbidden: Cross-project upstream access denied."})
-                    return
+            if not is_project_authorized(auth_info, proj, target_proj_id):
+                self._send_json_response(403, {"error": "Forbidden: Cross-project upstream access denied."})
+                return
 
             if not auth_info.get("is_admin") and auth_info.get("role") != "developer_admin":
                 self._send_json_response(403, {"error": "Forbidden: Developer management authorization required."})
@@ -409,24 +438,22 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
         elif path == "/api/stats":
             auth_info = resolve_auth_info(self)
             requested_project_id = query_params.get("project_id", [None])[0]
-            if requested_project_id:
+            if requested_project_id and requested_project_id != "all":
                 if not auth_info:
                     self._send_json_response(401, {"error": "Unauthorized: Authentication required to inspect project statistics."})
                     return
-                if not auth_info.get("is_admin"):
-                    proj = db.get_project(requested_project_id)
-                    dev_id = auth_info.get("developer_identity") or auth_info.get("owner_identity")
-                    if not proj or (proj.get("owner_identity") != dev_id and auth_info.get("project_id") != requested_project_id):
-                        self._send_json_response(403, {"error": "Forbidden: Cannot access another tenant's statistics."})
-                        return
+                proj = db.get_project(requested_project_id)
+                if not proj or not is_project_authorized(auth_info, proj, requested_project_id):
+                    self._send_json_response(403, {"error": "Forbidden: Cannot access another tenant's statistics."})
+                    return
                 stats = db.get_stats(project_id=requested_project_id)
-            elif auth_info and not auth_info.get("is_admin"):
+            elif auth_info and not auth_info.get("is_admin") and auth_info.get("role") != "developer_admin":
                 dev_id = auth_info.get("developer_identity") or auth_info.get("owner_identity")
                 user_projs = db.list_projects(owner_identity=dev_id)
                 if user_projs:
                     stats = db.get_stats(project_id=user_projs[0]["project_id"])
                 else:
-                    stats = db.get_stats(project_id=auth_info.get("project_id"))
+                    stats = db.get_stats(project_id=auth_info.get("project_id", "proj_default"))
             else:
                 stats = db.get_stats()
             self._send_json_response(200, stats)
@@ -464,18 +491,16 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
 
             # Strictly scope to requested authorized project or caller's project
             requested_proj = query_params.get("project_id", [None])[0]
-            if requested_proj:
-                if not auth_info.get("is_admin"):
-                    proj = db.get_project(requested_proj)
-                    dev_id = auth_info.get("developer_identity") or auth_info.get("owner_identity")
-                    if not proj or (proj.get("owner_identity") != dev_id and auth_info.get("project_id") != requested_proj):
-                        self._send_json_response(403, {"error": "Forbidden: Cross-project event access denied."})
-                        return
+            if requested_proj and requested_proj != "all":
+                proj = db.get_project(requested_proj)
+                if not proj or not is_project_authorized(auth_info, proj, requested_proj):
+                    self._send_json_response(403, {"error": "Forbidden: Cross-project event access denied."})
+                    return
                 project_id = requested_proj
-            elif not auth_info.get("is_admin"):
-                project_id = auth_info.get("project_id")
-            else:
+            elif auth_info.get("is_admin") or auth_info.get("role") == "developer_admin":
                 project_id = None
+            else:
+                project_id = auth_info.get("project_id")
 
             events = db.get_recent_events(limit=limit, offset=offset, project_id=project_id)
             self._send_json_response(200, {
@@ -534,9 +559,16 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
             dev_id = auth_info.get("developer_identity") or auth_info.get("owner_identity") or "developer"
             is_admin = bool(auth_info.get("is_admin", False))
             projects = db.list_projects(owner_identity=None if is_admin else dev_id)
+            if not is_admin and auth_info.get("role") == "developer_admin" and not any(p["project_id"] == "proj_default" for p in projects):
+                default_proj = db.get_project("proj_default")
+                if default_proj:
+                    projects = [default_proj] + projects
+            user_rec = db.get_developer_user_by_email(dev_id)
+            user_email = user_rec["email"] if user_rec else (dev_id if "@" in dev_id else f"{dev_id}@agentshield.io")
             self._send_json_response(200, {
                 "authenticated": True,
                 "developer_identity": dev_id,
+                "email": user_email,
                 "role": auth_info.get("role", "developer_admin"),
                 "is_admin": is_admin,
                 "session_token": auth_info.get("session_token"),
@@ -559,6 +591,10 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
             else:
                 dev_id = auth_info.get("developer_identity") or auth_info.get("owner_identity")
                 projects = db.list_projects(owner_identity=dev_id)
+                if auth_info.get("role") == "developer_admin" and not any(p["project_id"] == "proj_default" for p in projects):
+                    default_proj = db.get_project("proj_default")
+                    if default_proj:
+                        projects = [default_proj] + projects
             self._send_json_response(200, {"count": len(projects), "projects": projects})
 
         # GET /api/projects/<project_id>
@@ -572,11 +608,9 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
             if not proj:
                 self._send_json_response(404, {"error": f"Project '{target_proj_id}' not found."})
                 return
-            if not auth_info.get("is_admin"):
-                dev_id = auth_info.get("developer_identity") or auth_info.get("owner_identity")
-                if proj.get("owner_identity") != dev_id and auth_info.get("project_id") != target_proj_id:
-                    self._send_json_response(403, {"error": "Forbidden: Cross-project access denied."})
-                    return
+            if not is_project_authorized(auth_info, proj, target_proj_id):
+                self._send_json_response(403, {"error": "Forbidden: Cross-project access denied."})
+                return
             self._send_json_response(200, proj)
 
         # GET /api/projects/<project_id>/connect (Developer Connect endpoint metadata & SDK example)
@@ -592,11 +626,9 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
                 self._send_json_response(404, {"error": f"Project '{target_proj_id}' not found."})
                 return
 
-            if not auth_info.get("is_admin"):
-                dev_id = auth_info.get("developer_identity") or auth_info.get("owner_identity")
-                if proj.get("owner_identity") != dev_id and auth_info.get("project_id") != target_proj_id:
-                    self._send_json_response(403, {"error": "Forbidden: Cross-project connection access denied."})
-                    return
+            if not is_project_authorized(auth_info, proj, target_proj_id):
+                self._send_json_response(403, {"error": "Forbidden: Cross-project connection access denied."})
+                return
 
             events = db.get_recent_events(limit=1, project_id=target_proj_id)
             has_activity = len(events) > 0
@@ -673,11 +705,9 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
                 self._send_json_response(404, {"error": f"Project '{target_proj_id}' not found."})
                 return
 
-            if not auth_info.get("is_admin"):
-                dev_id = auth_info.get("developer_identity") or auth_info.get("owner_identity")
-                if proj.get("owner_identity") != dev_id and auth_info.get("project_id") != target_proj_id:
-                    self._send_json_response(403, {"error": "Forbidden: Cross-project policy access denied."})
-                    return
+            if not is_project_authorized(auth_info, proj, target_proj_id):
+                self._send_json_response(403, {"error": "Forbidden: Cross-project policy access denied."})
+                return
 
             policies = get_all_policies()
             stats = db.get_stats(project_id=target_proj_id)
@@ -711,11 +741,9 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
                 self._send_json_response(404, {"error": f"Project '{target_proj_id}' not found."})
                 return
 
-            if not auth_info.get("is_admin"):
-                dev_id = auth_info.get("developer_identity") or auth_info.get("owner_identity")
-                if proj.get("owner_identity") != dev_id and auth_info.get("project_id") != target_proj_id:
-                    self._send_json_response(403, {"error": "Forbidden: Cross-project credential access denied."})
-                    return
+            if not is_project_authorized(auth_info, proj, target_proj_id):
+                self._send_json_response(403, {"error": "Forbidden: Cross-project credential access denied."})
+                return
 
             if not auth_info.get("is_admin") and auth_info.get("role") != "developer_admin":
                 self._send_json_response(403, {"error": "Forbidden: Agent execution keys cannot inspect credential records. Developer management credentials required."})
@@ -732,19 +760,26 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
                 self._send_json_response(401, {"error": "Unauthorized: Valid project or admin token required."})
                 return
 
+            limit = int(query_params.get("limit", [50])[0])
+            offset = int(query_params.get("offset", [0])[0])
+
+            if target_proj_id == "all":
+                if not auth_info.get("is_admin") and auth_info.get("role") != "developer_admin":
+                    self._send_json_response(403, {"error": "Forbidden: Developer management authorization required for global feed."})
+                    return
+                events = db.get_recent_events(limit=limit, offset=offset, project_id=None)
+                self._send_json_response(200, {"project_id": "all", "count": len(events), "events": events})
+                return
+
             proj = db.get_project(target_proj_id)
             if not proj:
                 self._send_json_response(404, {"error": f"Project '{target_proj_id}' not found."})
                 return
 
-            if not auth_info.get("is_admin"):
-                dev_id = auth_info.get("developer_identity") or auth_info.get("owner_identity")
-                if proj.get("owner_identity") != dev_id and auth_info.get("project_id") != target_proj_id:
-                    self._send_json_response(403, {"error": "Forbidden: Cross-project event access denied."})
-                    return
+            if not is_project_authorized(auth_info, proj, target_proj_id):
+                self._send_json_response(403, {"error": "Forbidden: Cross-project event access denied."})
+                return
 
-            limit = int(query_params.get("limit", [50])[0])
-            offset = int(query_params.get("offset", [0])[0])
             events = db.get_recent_events(limit=limit, offset=offset, project_id=target_proj_id)
             self._send_json_response(200, {"project_id": target_proj_id, "count": len(events), "events": events})
 
@@ -761,11 +796,9 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
                 self._send_json_response(404, {"error": f"Project '{target_proj_id}' not found."})
                 return
 
-            if not auth_info.get("is_admin"):
-                dev_id = auth_info.get("developer_identity") or auth_info.get("owner_identity")
-                if proj.get("owner_identity") != dev_id and auth_info.get("project_id") != target_proj_id:
-                    self._send_json_response(403, {"error": "Forbidden: Cross-project upstream access denied."})
-                    return
+            if not is_project_authorized(auth_info, proj, target_proj_id):
+                self._send_json_response(403, {"error": "Forbidden: Cross-project upstream access denied."})
+                return
 
             if not auth_info.get("is_admin") and auth_info.get("role") != "developer_admin":
                 self._send_json_response(403, {"error": "Forbidden: Developer management authorization required to inspect upstream configurations."})
@@ -994,14 +1027,32 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
             try:
                 body = self.rfile.read(content_len) if content_len > 0 else b"{}"
                 payload = json.loads(body.decode("utf-8")) if body else {}
-                dev_id = payload.get("developer_identity", "").strip() or "dev_primary"
-                role = "developer_admin"
+
+                email = (payload.get("email") or "").strip()
+                password = payload.get("password") or ""
+
+                if email or password:
+                    # Email & Password authentication using salted PBKDF2
+                    user = db.authenticate_developer_user(email, password)
+                    if not user:
+                        self._send_json_response(401, {"error": "Invalid email or password."})
+                        return
+                    dev_id = user["developer_identity"]
+                    role = user["role"]
+                    user_email = user["email"]
+                else:
+                    # Legacy / test harness fallback: developer_identity
+                    dev_id = payload.get("developer_identity", "").strip() or "dev_primary"
+                    role = "developer_admin"
+                    user_email = f"{dev_id}@agentshield.io"
+
                 sess = db.create_developer_session(developer_identity=dev_id, role=role)
                 session_cookie = f"agentshield_session={sess['session_token']}; {get_session_cookie_flags(self)}"
                 csrf_cookie = f"agentshield_csrf={sess['csrf_token']}; {get_csrf_cookie_flags(self)}"
                 self._send_json_response(200, {
                     "status": "authenticated",
                     "developer_identity": dev_id,
+                    "email": user_email,
                     "role": role,
                     "session_token": sess["session_token"],
                     "csrf_token": sess["csrf_token"],
@@ -1009,6 +1060,44 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
                 }, cookies=[session_cookie, csrf_cookie])
             except Exception as e:
                 self._send_json_response(400, {"error": f"Login failed: {str(e)}"})
+
+        # POST /api/auth/register (Create new developer account and establish session)
+        elif path == "/api/auth/register":
+            if not login_limiter.allow(f"register:{client_ip}"):
+                self._send_json_response(429, {"error": "Too many registration attempts. Please wait before retrying."})
+                return
+
+            try:
+                body = self.rfile.read(content_len) if content_len > 0 else b"{}"
+                payload = json.loads(body.decode("utf-8")) if body else {}
+                email = (payload.get("email") or "").strip()
+                password = payload.get("password") or ""
+                dev_identity = (payload.get("developer_identity") or "").strip() or None
+
+                if not email or not password:
+                    self._send_json_response(400, {"error": "Email and password are required."})
+                    return
+
+                user = db.register_developer_user(email=email, password=password, developer_identity=dev_identity)
+                dev_id = user["developer_identity"]
+                role = user["role"]
+
+                sess = db.create_developer_session(developer_identity=dev_id, role=role)
+                session_cookie = f"agentshield_session={sess['session_token']}; {get_session_cookie_flags(self)}"
+                csrf_cookie = f"agentshield_csrf={sess['csrf_token']}; {get_csrf_cookie_flags(self)}"
+                self._send_json_response(201, {
+                    "status": "registered",
+                    "developer_identity": dev_id,
+                    "email": user["email"],
+                    "role": role,
+                    "session_token": sess["session_token"],
+                    "csrf_token": sess["csrf_token"],
+                    "expires_at": sess["expires_at"],
+                }, cookies=[session_cookie, csrf_cookie])
+            except ValueError as ve:
+                self._send_json_response(400, {"error": str(ve)})
+            except Exception as e:
+                self._send_json_response(500, {"error": f"Registration failed: {str(e)}"})
 
         # POST /api/auth/logout (Terminate developer session and clear cookies)
         elif path == "/api/auth/logout":
@@ -1018,9 +1107,23 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
                 if part.startswith("agentshield_session="):
                     token = part.split("=", 1)[1].strip()
                     db.invalidate_developer_session(token)
+            hdr_token = extract_token_from_handler(self)
+            if hdr_token and hdr_token.startswith("sess_"):
+                db.invalidate_developer_session(hdr_token)
             session_cookie = f"agentshield_session=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; {get_session_cookie_flags(self)}"
             csrf_cookie = f"agentshield_csrf=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; {get_csrf_cookie_flags(self)}"
             self._send_json_response(200, {"status": "logged_out"}, cookies=[session_cookie, csrf_cookie])
+
+        # POST /api/admin/reset-rate-limits (Clear rate limiter records for testing/admin maintenance)
+        elif path == "/api/admin/reset-rate-limits":
+            auth_info = resolve_auth_info(self)
+            if not auth_info or not auth_info.get("is_admin"):
+                self._send_json_response(401, {"error": "Unauthorized: Admin privileges required."})
+                return
+            login_limiter.reset()
+            mcp_limiter.reset()
+            self._send_json_response(200, {"status": "rate_limits_reset"})
+            return
 
         # POST /api/projects (Create new project - Admin or authenticated developer)
         elif len(parts) == 2 and parts == ["api", "projects"]:
@@ -1064,11 +1167,9 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
                 self._send_json_response(404, {"error": f"Project '{target_proj_id}' not found."})
                 return
 
-            if not auth_info.get("is_admin"):
-                dev_id = auth_info.get("developer_identity") or auth_info.get("owner_identity")
-                if proj.get("owner_identity") != dev_id and auth_info.get("project_id") != target_proj_id:
-                    self._send_json_response(403, {"error": "Forbidden: Cross-project credential issuance denied."})
-                    return
+            if not is_project_authorized(auth_info, proj, target_proj_id):
+                self._send_json_response(403, {"error": "Forbidden: Cross-project credential issuance denied."})
+                return
 
             if not auth_info.get("is_admin") and auth_info.get("role") != "developer_admin":
                 self._send_json_response(403, {"error": "Forbidden: Agent execution keys cannot issue credentials. Developer management credentials required."})
@@ -1108,11 +1209,9 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
                 self._send_json_response(404, {"error": f"Project '{target_proj_id}' not found."})
                 return
 
-            if not auth_info.get("is_admin"):
-                dev_id = auth_info.get("developer_identity") or auth_info.get("owner_identity")
-                if proj.get("owner_identity") != dev_id and auth_info.get("project_id") != target_proj_id:
-                    self._send_json_response(403, {"error": "Forbidden: Cross-project credential revocation denied."})
-                    return
+            if not is_project_authorized(auth_info, proj, target_proj_id):
+                self._send_json_response(403, {"error": "Forbidden: Cross-project credential revocation denied."})
+                return
 
             if not auth_info.get("is_admin") and auth_info.get("role") != "developer_admin":
                 self._send_json_response(403, {"error": "Forbidden: Agent execution keys cannot revoke credentials. Developer management credentials required."})
@@ -1141,11 +1240,9 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
                 self._send_json_response(404, {"error": f"Project '{target_proj_id}' not found."})
                 return
 
-            if not auth_info.get("is_admin"):
-                dev_id = auth_info.get("developer_identity") or auth_info.get("owner_identity")
-                if proj.get("owner_identity") != dev_id and auth_info.get("project_id") != target_proj_id:
-                    self._send_json_response(403, {"error": "Forbidden: Cross-project credential rotation denied."})
-                    return
+            if not is_project_authorized(auth_info, proj, target_proj_id):
+                self._send_json_response(403, {"error": "Forbidden: Cross-project credential rotation denied."})
+                return
 
             if not auth_info.get("is_admin") and auth_info.get("role") != "developer_admin":
                 self._send_json_response(403, {"error": "Forbidden: Agent execution keys cannot rotate credentials. Developer management credentials required."})
@@ -1173,11 +1270,9 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
                 self._send_json_response(404, {"error": f"Project '{target_proj_id}' not found."})
                 return
 
-            if not auth_info.get("is_admin"):
-                dev_id = auth_info.get("developer_identity") or auth_info.get("owner_identity")
-                if proj.get("owner_identity") != dev_id and auth_info.get("project_id") != target_proj_id:
-                    self._send_json_response(403, {"error": "Forbidden: Cross-project upstream access denied."})
-                    return
+            if not is_project_authorized(auth_info, proj, target_proj_id):
+                self._send_json_response(403, {"error": "Forbidden: Cross-project upstream access denied."})
+                return
 
             if not auth_info.get("is_admin") and auth_info.get("role") != "developer_admin":
                 self._send_json_response(403, {"error": "Forbidden: Developer management authorization required."})
@@ -1233,11 +1328,9 @@ class AgentShieldAPIHandler(BaseHTTPRequestHandler):
                 self._send_json_response(404, {"error": f"Project '{target_proj_id}' not found."})
                 return
 
-            if not auth_info.get("is_admin"):
-                dev_id = auth_info.get("developer_identity") or auth_info.get("owner_identity")
-                if proj.get("owner_identity") != dev_id and auth_info.get("project_id") != target_proj_id:
-                    self._send_json_response(403, {"error": "Forbidden: Cross-project upstream access denied."})
-                    return
+            if not is_project_authorized(auth_info, proj, target_proj_id):
+                self._send_json_response(403, {"error": "Forbidden: Cross-project upstream access denied."})
+                return
 
             if not auth_info.get("is_admin") and auth_info.get("role") != "developer_admin":
                 self._send_json_response(403, {"error": "Forbidden: Developer management authorization required."})

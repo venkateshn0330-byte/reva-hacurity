@@ -14,7 +14,7 @@ import os
 import secrets
 import sqlite3
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Locate data directory relative to repository (configurable via AGENTSHIELD_DB_PATH)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -235,6 +235,22 @@ def init_db() -> None:
                     """
                 )
 
+                # 9. Developer Users table (for secure email & password authentication)
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS developer_users (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        email TEXT UNIQUE NOT NULL,
+                        password_hash TEXT NOT NULL,
+                        salt TEXT NOT NULL,
+                        developer_identity TEXT NOT NULL,
+                        role TEXT NOT NULL DEFAULT 'developer_admin',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    """
+                )
+
                 # Migration checks for existing databases
                 try:
                     conn.execute("ALTER TABLE security_events ADD COLUMN policy_id INTEGER DEFAULT 14;")
@@ -260,6 +276,10 @@ def init_db() -> None:
                     conn.execute("ALTER TABLE developer_sessions ADD COLUMN csrf_token TEXT;")
                 except Exception:
                     pass
+                try:
+                    conn.execute("ALTER TABLE security_events ADD COLUMN event_source TEXT DEFAULT 'mcp_live';")
+                except Exception:
+                    pass
 
                 # Seed default project if absent
                 now_iso = datetime.now(timezone.utc).isoformat()
@@ -276,6 +296,23 @@ def init_db() -> None:
                     WHERE project_id = 'proj_default' AND owner_identity = 'system-admin';
                     """
                 )
+
+                # Seed initial developer account if absent
+                try:
+                    user_count = conn.execute("SELECT COUNT(*) FROM developer_users;").fetchone()[0]
+                    if user_count == 0:
+                        salt_bytes = secrets.token_bytes(16)
+                        pwd_hash = hashlib.pbkdf2_hmac("sha256", "AgentShield2026!".encode("utf-8"), salt_bytes, 100_000).hex()
+                        salt_hex = salt_bytes.hex()
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO developer_users (email, password_hash, salt, developer_identity, role, created_at, updated_at)
+                            VALUES ('dev@agentshield.io', ?, ?, 'dev_primary', 'developer_admin', ?, ?)
+                            """,
+                            (pwd_hash, salt_hex, now_iso, now_iso),
+                        )
+                except Exception:
+                    pass
         finally:
             conn.close()
 
@@ -295,6 +332,7 @@ def log_security_event(
     timestamp: Optional[str] = None,
     project_id: str = "proj_default",
     is_upstream: int = 0,
+    event_source: str = "mcp_live",
 ) -> Dict[str, Any]:
     """
     Log a security decision event into SQLite.
@@ -314,6 +352,8 @@ def log_security_event(
         else:
             safe_args[k] = v
 
+    resolved_source = event_source or ("fuzzer_test" if agent_id in ("demo-agent", "suite-agent") else "mcp_live")
+
     record = {
         "project_id": project_id,
         "request_id": request_id,
@@ -329,6 +369,7 @@ def log_security_event(
         "policy_id": policy_id,
         "policy_code": policy_code,
         "is_upstream": 1 if is_upstream else 0,
+        "event_source": resolved_source,
     }
 
     with _lock:
@@ -340,11 +381,11 @@ def log_security_event(
                     INSERT INTO security_events (
                         project_id, request_id, timestamp, agent_id, tool_name,
                         resource_or_destination, arguments_json, allowed,
-                        reason, risk_level, downstream_status, policy_id, policy_code, is_upstream
+                        reason, risk_level, downstream_status, policy_id, policy_code, is_upstream, event_source
                     ) VALUES (
                         :project_id, :request_id, :timestamp, :agent_id, :tool_name,
                         :resource_or_destination, :arguments_json, :allowed,
-                        :reason, :risk_level, :downstream_status, :policy_id, :policy_code, :is_upstream
+                        :reason, :risk_level, :downstream_status, :policy_id, :policy_code, :is_upstream, :event_source
                     )
                     """,
                     record,
@@ -423,6 +464,126 @@ def list_projects(owner_identity: Optional[str] = None) -> List[Dict[str, Any]]:
                     "SELECT project_id, name, owner_identity, status, created_at, updated_at FROM projects ORDER BY created_at DESC"
                 ).fetchall()
             return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+
+# =========================================================================
+# DEVELOPER USER ACCOUNTS & PASSWORD MANAGEMENT
+# =========================================================================
+
+def hash_password(password: str, salt: Optional[bytes] = None) -> Tuple[str, str]:
+    """Cryptographically secure PBKDF2-HMAC-SHA256 password hashing with unique salt."""
+    if salt is None:
+        salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
+    return dk.hex(), salt.hex()
+
+
+def verify_password(password: str, password_hash: str, salt_hex: str) -> bool:
+    """Constant-time PBKDF2 password verification."""
+    try:
+        salt = bytes.fromhex(salt_hex)
+        expected_hash = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000).hex()
+        return hmac.compare_digest(password_hash, expected_hash)
+    except Exception:
+        return False
+
+
+def register_developer_user(
+    email: str,
+    password: str,
+    developer_identity: Optional[str] = None,
+    role: str = "developer_admin"
+) -> Dict[str, Any]:
+    """Register a new developer user with salted PBKDF2 password."""
+    init_db()
+    email_clean = (email or "").strip().lower()
+    if not email_clean or "@" not in email_clean or "." not in email_clean:
+        raise ValueError("A valid email address is required.")
+    if len(password) < 8:
+        raise ValueError("Password must be at least 8 characters long.")
+
+    dev_id = (developer_identity or "").strip() or email_clean.split("@")[0]
+    pwd_hash, salt_hex = hash_password(password)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    with _lock:
+        conn = get_db_connection()
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO developer_users (email, password_hash, salt, developer_identity, role, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (email_clean, pwd_hash, salt_hex, dev_id, role, now_iso, now_iso),
+            )
+            user_id = cursor.lastrowid
+
+            # Ensure this developer has an active workspace project
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO projects (project_id, name, owner_identity, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'active', ?, ?)
+                """,
+                (f"proj_{dev_id}", f"{dev_id.capitalize()} Workspace", dev_id, now_iso, now_iso),
+            )
+            conn.commit()
+
+            return {
+                "id": user_id,
+                "email": email_clean,
+                "developer_identity": dev_id,
+                "role": role,
+                "created_at": now_iso,
+            }
+        except sqlite3.IntegrityError:
+            raise ValueError(f"An account with email '{email_clean}' already exists.")
+        finally:
+            conn.close()
+
+
+def authenticate_developer_user(email: str, password: str) -> Optional[Dict[str, Any]]:
+    """Authenticate developer credentials and return user record if valid."""
+    init_db()
+    email_clean = (email or "").strip().lower()
+    if not email_clean or not password:
+        return None
+
+    with _lock:
+        conn = get_db_connection()
+        try:
+            row = conn.execute(
+                "SELECT id, email, password_hash, salt, developer_identity, role, created_at FROM developer_users WHERE email = ?",
+                (email_clean,),
+            ).fetchone()
+            if not row:
+                return None
+
+            if verify_password(password, row["password_hash"], row["salt"]):
+                return {
+                    "id": row["id"],
+                    "email": row["email"],
+                    "developer_identity": row["developer_identity"],
+                    "role": row["role"],
+                    "created_at": row["created_at"],
+                }
+            return None
+        finally:
+            conn.close()
+
+
+def get_developer_user_by_email(email: str) -> Optional[Dict[str, Any]]:
+    init_db()
+    ident = (email or "").strip().lower()
+    with _lock:
+        conn = get_db_connection()
+        try:
+            row = conn.execute(
+                "SELECT id, email, developer_identity, role, created_at FROM developer_users WHERE email = ? OR LOWER(developer_identity) = ?",
+                (ident, ident),
+            ).fetchone()
+            return dict(row) if row else None
         finally:
             conn.close()
 
@@ -844,13 +1005,14 @@ def get_recent_events(limit: int = 50, offset: int = 0, project_id: Optional[str
     with _lock:
         conn = get_db_connection()
         try:
-            if project_id:
+            if project_id and project_id != "all":
                 cursor = conn.execute(
                     """
                     SELECT id, project_id, request_id, timestamp, agent_id, tool_name,
                            resource_or_destination, arguments_json, allowed,
                            reason, risk_level, downstream_status, policy_id, policy_code,
-                           COALESCE(is_upstream, 0) as is_upstream
+                           COALESCE(is_upstream, 0) as is_upstream,
+                           COALESCE(event_source, CASE WHEN agent_id IN ('demo-agent', 'suite-agent') THEN 'fuzzer_test' ELSE 'mcp_live' END) as event_source
                     FROM security_events
                     WHERE project_id = ?
                     ORDER BY id DESC
@@ -864,7 +1026,8 @@ def get_recent_events(limit: int = 50, offset: int = 0, project_id: Optional[str
                     SELECT id, project_id, request_id, timestamp, agent_id, tool_name,
                            resource_or_destination, arguments_json, allowed,
                            reason, risk_level, downstream_status, policy_id, policy_code,
-                           COALESCE(is_upstream, 0) as is_upstream
+                           COALESCE(is_upstream, 0) as is_upstream,
+                           COALESCE(event_source, CASE WHEN agent_id IN ('demo-agent', 'suite-agent') THEN 'fuzzer_test' ELSE 'mcp_live' END) as event_source
                     FROM security_events
                     ORDER BY id DESC
                     LIMIT ? OFFSET ?
@@ -890,6 +1053,7 @@ def get_recent_events(limit: int = 50, offset: int = 0, project_id: Optional[str
                     "policy_id": r["policy_id"] if "policy_id" in r.keys() else 14,
                     "policy_code": r["policy_code"] if "policy_code" in r.keys() else "P-AUTHZ",
                     "is_upstream": bool(r["is_upstream"] if "is_upstream" in r.keys() else 0),
+                    "event_source": r["event_source"] if "event_source" in r.keys() else "mcp_live",
                 })
             return events
         finally:
@@ -943,13 +1107,24 @@ def get_stats(project_id: Optional[str] = None) -> Dict[str, Any]:
             # Policy enforcement breakdown
             policy_breakdown = {}
             try:
-                p_cursor = conn.execute(
-                    """
-                    SELECT policy_code, allowed, COUNT(*) as cnt
-                    FROM security_events
-                    GROUP BY policy_code, allowed
-                    """
-                )
+                if project_id:
+                    p_cursor = conn.execute(
+                        """
+                        SELECT policy_code, allowed, COUNT(*) as cnt
+                        FROM security_events
+                        WHERE project_id = ?
+                        GROUP BY policy_code, allowed
+                        """,
+                        (project_id,),
+                    )
+                else:
+                    p_cursor = conn.execute(
+                        """
+                        SELECT policy_code, allowed, COUNT(*) as cnt
+                        FROM security_events
+                        GROUP BY policy_code, allowed
+                        """
+                    )
                 for row in p_cursor.fetchall():
                     pcode = row["policy_code"] or "P-AUTHZ"
                     if pcode not in policy_breakdown:
@@ -961,10 +1136,29 @@ def get_stats(project_id: Optional[str] = None) -> Dict[str, Any]:
             except Exception:
                 pass
 
+            block_rate_float = (blocked / total * 100) if total > 0 else 0.0
+
+            # Count real MCP vs fuzzer tests
+            real_mcp_clause = "WHERE (event_source = 'mcp_live' OR (event_source IS NULL AND agent_id NOT IN ('demo-agent', 'suite-agent')))"
+            fuzzer_clause = "WHERE (event_source = 'fuzzer_test' OR (event_source IS NULL AND agent_id IN ('demo-agent', 'suite-agent')))"
+            if project_id and project_id != "all":
+                real_mcp_cnt = conn.execute(f"SELECT COUNT(*) FROM security_events {real_mcp_clause} AND project_id = ?", (project_id,)).fetchone()[0]
+                fuzzer_cnt = conn.execute(f"SELECT COUNT(*) FROM security_events {fuzzer_clause} AND project_id = ?", (project_id,)).fetchone()[0]
+            else:
+                real_mcp_cnt = conn.execute(f"SELECT COUNT(*) FROM security_events {real_mcp_clause}").fetchone()[0]
+                fuzzer_cnt = conn.execute(f"SELECT COUNT(*) FROM security_events {fuzzer_clause}").fetchone()[0]
+
             return {
                 "total_requests": total,
                 "allowed_requests": allowed,
                 "blocked_requests": blocked,
+                "total_intercepted": total,
+                "allowed_count": allowed,
+                "blocked_count": blocked,
+                "real_mcp_count": real_mcp_cnt,
+                "fuzzer_count": fuzzer_cnt,
+                "block_rate": f"{block_rate_float:.1f}%",
+                "block_rate_pct": round(block_rate_float, 1),
                 "tests_completed": tests_run,
                 "tool_breakdown": tool_breakdown,
                 "policy_breakdown": policy_breakdown,
